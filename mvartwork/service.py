@@ -18,7 +18,7 @@ from urllib.parse import urlsplit, parse_qs, unquote
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 from urllib.error import HTTPError, URLError
 
-VERSION = "0.1.0-dev"
+VERSION = "0.1.0"
 ORIGINS = {"artworks.thetvdb.com", "images.thetvdb.com",
            "thetvdb.com", "www.thetvdb.com", "image.tmdb.org"}
 MAX_IMAGE = 12 * 1024 * 1024
