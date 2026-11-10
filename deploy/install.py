@@ -18,6 +18,9 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
+import urllib.request
+import urllib.error
 
 APP_ROOT=Path("/opt/mvartwork")
 DATA=Path("/var/lib/mvartwork")
@@ -77,6 +80,48 @@ def verified_files(bundle, expected):
 def run(*args):
     subprocess.run(args,check=True,timeout=90)
 
+def ensure_release_readable(release, account):
+    """Keep the source root-owned, with group read/traverse for service user.
+
+    A root-owned 0700 parent causes systemd status=200/CHDIR despite the
+    installer briefly observing systemctl is-active. Do not expose software
+    directories to non-group accounts or follow unsafe symlinks.
+    """
+    roots=(APP_ROOT, APP_ROOT/"releases", release)
+    for root in roots:
+        if root.is_symlink() or not root.is_dir():
+            raise RuntimeError("Unsafe MVArtwork release directory.")
+    for directory in (APP_ROOT, APP_ROOT/"releases", *[release]+[
+            item for item in release.rglob("*") if item.is_dir()]):
+        if directory.is_symlink() or not directory.is_dir():
+            raise RuntimeError("Unsafe MVArtwork directory.")
+        os.chown(directory, -1, account.pw_gid)
+        os.chmod(directory, 0o750)
+
+
+def wait_for_service_health(max_attempts=35):
+    """Prove stable application health; a systemctl start is not enough."""
+    opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    healthy_count=0
+    last_problem="Service not yet ready."
+    for attempt in range(max_attempts):
+        try:
+            run("systemctl","is-active","--quiet","mvartwork.service")
+            with opener.open("http://127.0.0.1:9494/health",timeout=2) as response:
+                body=response.read(4096)
+                if response.status != 200 or json.loads(body).get("status") != "ok":
+                    raise RuntimeError("MVArtwork returned an unhealthy response.")
+            healthy_count+=1
+            if healthy_count>=2:
+                return
+        except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError,
+                urllib.error.URLError) as error:
+            healthy_count=0
+            last_problem=type(error).__name__
+        time.sleep(.25)
+    raise RuntimeError("MVArtwork failed service and HTTP health verification: "+last_problem)
+
+
 def install(bundle,sha):
     entries=verified_files(bundle,sha)
     account=pwd.getpwnam(SERVICE_USER)
@@ -93,6 +138,7 @@ def install(bundle,sha):
             os.rename(staging,release)
     finally:
         if staging.exists(): shutil.rmtree(staging)
+    ensure_release_readable(release,account)
     DATA.mkdir(parents=True,exist_ok=True)
     os.chown(DATA,account.pw_uid,account.pw_gid)
     if not TOKEN.exists():
@@ -112,7 +158,7 @@ def install(bundle,sha):
         run("systemctl","daemon-reload")
         run("systemctl","enable","--now","mvartwork.service")
         run("systemctl","restart","mvartwork.service")
-        run("systemctl","is-active","--quiet","mvartwork.service")
+        wait_for_service_health()
     except Exception:
         if old is not None:
             next_link.symlink_to(old);os.replace(next_link,link)
