@@ -85,3 +85,77 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(len(self.store.items("series")),2)
 
 if __name__=="__main__":unittest.main()
+
+class PagedLibraryFixture(unittest.TestCase):
+    def setUp(self):
+        self.folder=tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        self.store=Store(self.folder.name,lambda _:PNG)
+        for n,name in enumerate(("Alpha & Omega","Beta: Episode","Gamma","Delta"),1):
+            self.store.register({"manager":"series","entity":"series","library_id":str(n),
+                                 "title":name,"source_url":URL})
+        self.store.register({"manager":"series","entity":"season","library_id":"1",
+                             "season":1,"title":"Alpha & Omega"})
+        self.store.register({"manager":"movie","entity":"movie","library_id":"1",
+                             "title":"Movie Alpha","imdb_id":"tt9876543"})
+
+    def test_bounded_paged_browse_has_total_and_no_cross_manager_leakage(self):
+        first=self.store.page(manager="series",limit=2)
+        self.assertEqual(first["total"],5)
+        self.assertEqual(len(first["items"]),2)
+        self.assertTrue(first["hasMore"])
+        nxt=self.store.page(manager="series",limit=2,offset=2)
+        self.assertEqual(nxt["total"],5)
+        self.assertEqual(len(nxt["items"]),2)
+        last=self.store.page(manager="series",limit=2,offset=4)
+        self.assertFalse(last["hasMore"])
+        self.assertEqual(len(last["items"]),1)
+        self.assertFalse(any(it["manager"]=="movie" for it in first["items"]+nxt["items"]+last["items"]))
+        self.assertEqual(self.store.page(manager="movie")["total"],1)
+
+    def test_title_and_provider_id_search_is_scoped_and_parameterized(self):
+        data=self.store.page(manager="series",search="Alpha")
+        self.assertEqual(data["total"],2)
+        self.assertEqual(self.store.page(manager="movie",search="tt9876543")["total"],1)
+        self.assertEqual(self.store.page(manager="series",search="tt9876543")["total"],0)
+        self.assertEqual(self.store.page(manager="series",search="%' OR 1=1 --")["total"],0)
+        self.assertEqual(self.store.page(manager="series",search="_")["total"],0)
+        self.assertEqual(self.store.page(manager="series",entity="season")["total"],1)
+
+    def test_status_filters_and_preserve_posters_on_reregistration(self):
+        self.store.process_next()
+        self.assertEqual(self.store.page(manager="series",status="cached")["total"],1)
+        self.assertEqual(self.store.page(manager="series",status="missing")["total"],4)
+        self.store.upload({"manager":"movie","entity":"movie","library_id":"1",
+                           "base64":base64.b64encode(PNG).decode()})
+        locked=self.store.page(manager="movie",status="locked")
+        self.assertEqual(locked["total"],1)
+        self.assertEqual(locked["items"][0]["title"],"Movie Alpha")
+        original=self.store.item(("movie","movie","1",-1))["sha256"]
+        self.store.register({"manager":"movie","entity":"movie","library_id":"1",
+                             "title":"Updated Movie Alpha"})
+        self.assertEqual(self.store.item(("movie","movie","1",-1))["sha256"],original)
+        self.assertEqual(self.store.page(manager="movie",search="Updated Movie Alpha")["total"],1)
+
+    def test_v010_database_is_upgraded_additively_and_poster_bytes_remain(self):
+        self.store.register({"manager":"series","entity":"series","library_id":"30",
+                             "title":"Survivor","source_url":URL})
+        self.store.process_next()
+        key=("series","series","30",-1)
+        expected=self.store.item(key)["sha256"]
+        import sqlite3
+        # Model an old v0.1.0 DB by removing the new column in a disposable copy.
+        self.store=None
+        db=sqlite3.connect(self.folder.name+"/artwork.sqlite3")
+        db.execute("ALTER TABLE artwork DROP COLUMN title")
+        db.commit();db.close()
+        reopened=Store(self.folder.name,lambda _:PNG)
+        self.assertIsNone(reopened.item(key)["title"])
+        self.assertEqual(reopened.item(key)["sha256"],expected)
+        self.assertEqual(reopened.page(manager="series")["total"],6)
+
+    def test_invalid_filter_or_search_is_rejected(self):
+        for kw in ({"manager":"other"},{"status":"everything"},{"entity":"unrestricted"},
+                   {"search":"a"*121},{"limit":10000},{"offset":-1}):
+            with self.assertRaises(ValueError):
+                self.store.page(**kw)

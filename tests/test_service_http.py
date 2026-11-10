@@ -57,6 +57,24 @@ class HttpFixture(unittest.TestCase):
         status,_,body=self.req("POST","/v1/resume",{})
         self.assertEqual(status,200)
         self.assertFalse(json.loads(body)["paused"])
+    def test_paginated_http_filters_and_total(self):
+        for i in range(4):
+            status,_,body=self.req("POST","/v1/items",
+                {"manager":"movie","entity":"movie","library_id":str(i+1),
+                 "title":"Movie "+str(i+1)})
+            self.assertEqual(status,200)
+        status,_,body=self.req("GET","/v1/items?manager=movie&search=Movie&limit=2&offset=2")
+        self.assertEqual(status,200)
+        page=json.loads(body)
+        self.assertEqual(page["total"],4)
+        self.assertEqual(len(page["items"]),2)
+        self.assertFalse(page["hasMore"])
+        status,_,body=self.req("GET","/v1/items?manager=movie&status=unknown")
+        self.assertEqual(status,400)
+        status,_,body=self.req("GET","/v1/items?manager=movie&search=%25")
+        self.assertEqual(status,200)
+        self.assertEqual(json.loads(body)["total"],0)
+
     def test_upload_and_invalid_cross_manager(self):
         status,_,body=self.req("POST","/v1/upload",{
             "manager":"movie","entity":"movie","library_id":"19",

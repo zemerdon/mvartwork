@@ -18,7 +18,7 @@ from urllib.parse import urlsplit, parse_qs, unquote
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 from urllib.error import HTTPError, URLError
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 ORIGINS = {"artworks.thetvdb.com", "images.thetvdb.com",
            "thetvdb.com", "www.thetvdb.com", "image.tmdb.org"}
 MAX_IMAGE = 12 * 1024 * 1024
@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS artwork (
  library_id TEXT NOT NULL,
  season INTEGER NOT NULL DEFAULT -1,
  imdb_id TEXT, tvdb_id TEXT, tmdb_id TEXT,
- source_url TEXT, language TEXT,
+ source_url TEXT, language TEXT, title TEXT,
  sha256 TEXT, mime TEXT, bytes INTEGER NOT NULL DEFAULT 0,
  pinned INTEGER NOT NULL DEFAULT 0,
  updated TEXT, error TEXT,
@@ -118,6 +118,12 @@ class Store:
         self.closed = False
         with self.connect() as db:
             db.executescript(CREATE)
+            # Additive, backward-compatible column for a v0.1.0 catalogue;
+            # never rebuild, truncate or replace the user's poster database.
+            columns={col["name"] for col in db.execute("PRAGMA table_info(artwork)")}
+            if "title" not in columns:
+                db.execute("ALTER TABLE artwork ADD COLUMN title TEXT")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_artwork_browse ON artwork(manager,entity,library_id,season)")
             # A service crash during download must not strand queue entries.
             db.execute("UPDATE jobs SET state='retry',due=0 WHERE state='running'")
 
@@ -154,6 +160,11 @@ class Store:
         language = data.get("language") or None
         if language and (not isinstance(language,str) or not re.fullmatch(r"[A-Za-z-]{2,16}", language)):
             raise ValueError("Invalid poster language.")
+        title=data.get("title")
+        if title is not None:
+            if not isinstance(title,str) or len(title)>300 or any(ord(c)<32 for c in title):
+                raise ValueError("Invalid artwork title.")
+            title=title.strip() or None
         ids = []
         for k in ("imdb_id","tvdb_id","tmdb_id"):
             v = data.get(k)
@@ -162,14 +173,15 @@ class Store:
             ids.append(v)
         with self.lock, self.connect() as db:
             before = db.execute("SELECT sha256,pinned FROM artwork WHERE manager=? AND entity=? AND library_id=? AND season=?", key).fetchone()
-            db.execute("""INSERT INTO artwork(manager,entity,library_id,season,imdb_id,tvdb_id,tmdb_id,source_url,language)
-                VALUES(?,?,?,?,?,?,?,?,?)
+            db.execute("""INSERT INTO artwork(manager,entity,library_id,season,imdb_id,tvdb_id,tmdb_id,source_url,language,title)
+                VALUES(?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(manager,entity,library_id,season) DO UPDATE SET
                  imdb_id=COALESCE(excluded.imdb_id,artwork.imdb_id),
                  tvdb_id=COALESCE(excluded.tvdb_id,artwork.tvdb_id),
                  tmdb_id=COALESCE(excluded.tmdb_id,artwork.tmdb_id),
                  source_url=COALESCE(excluded.source_url,artwork.source_url),
-                 language=COALESCE(excluded.language,artwork.language)""", (*key,*ids,url,language))
+                 language=COALESCE(excluded.language,artwork.language),
+                 title=COALESCE(excluded.title,artwork.title)""", (*key,*ids,url,language,title))
             if url and (before is None or before["sha256"] is None) and (before is None or not before["pinned"]):
                 self._enqueue(db,key)
             db.commit()
@@ -243,6 +255,49 @@ class Store:
         sql="SELECT * FROM artwork WHERE (? IS NULL OR manager=?) AND (?=0 OR sha256 IS NULL) ORDER BY manager,entity,library_id,season LIMIT ? OFFSET ?"
         with self.connect() as db:
             return [dict(x) for x in db.execute(sql,(manager,manager,1 if missing else 0,limit,offset))]
+
+    def page(self, manager=None, entity="all", status="all", search="", limit=50, offset=0):
+        if manager not in (None,"series","movie"):
+            raise ValueError("Invalid manager.")
+        if entity not in ("all","series","season","movie"):
+            raise ValueError("Invalid artwork entity filter.")
+        if status not in ("all","cached","missing","failed","locked"):
+            raise ValueError("Invalid artwork status filter.")
+        if not isinstance(search,str) or len(search)>120 or any(ord(ch)<32 for ch in search):
+            raise ValueError("Invalid artwork search text.")
+        if type(limit) is not int or not (1<=limit<=100) or type(offset) is not int or not (0<=offset<=1000000):
+            raise ValueError("Invalid artwork pagination.")
+        clauses=[]; args=[]
+        if manager is not None:
+            clauses.append("manager=?");args.append(manager)
+        if entity!="all":
+            clauses.append("entity=?");args.append(entity)
+        if status=="cached":
+            clauses.append("sha256 IS NOT NULL")
+        elif status=="missing":
+            clauses.append("sha256 IS NULL")
+        elif status=="failed":
+            clauses.append("error IS NOT NULL")
+        elif status=="locked":
+            clauses.append("pinned=1")
+        if search.strip():
+            # Escaped parameters; '%' and '_' are literal search text, not
+            # user-controlled SQL wildcards. Search is scoped to one manager.
+            term=search.strip().replace("!","!!").replace("%","!%").replace("_","!_")
+            clauses.append("""(COALESCE(title,'') LIKE ? ESCAPE '!' OR
+                library_id LIKE ? ESCAPE '!' OR
+                COALESCE(imdb_id,'') LIKE ? ESCAPE '!' OR
+                COALESCE(tvdb_id,'') LIKE ? ESCAPE '!' OR
+                COALESCE(tmdb_id,'') LIKE ? ESCAPE '!')""")
+            args.extend(["%"+term+"%"]*5)
+        where=" WHERE "+" AND ".join(clauses) if clauses else ""
+        with self.connect() as db:
+            total=db.execute("SELECT count(*) FROM artwork"+where,args).fetchone()[0]
+            rows=db.execute("""SELECT * FROM artwork"""+where+
+                """ ORDER BY (title IS NULL),title COLLATE NOCASE,entity,library_id,season LIMIT ? OFFSET ?""",
+                (*args,limit,offset)).fetchall()
+        return {"items":[dict(row) for row in rows],"total":total,"offset":offset,
+                "limit":limit,"hasMore":offset+len(rows)<total}
 
     def poster(self,key):
         entry=self.item(key)
@@ -325,9 +380,12 @@ class Handler(BaseHTTPRequestHandler):
             if path=="/v1/status": return self.send_json(200,self.store.stats())
             if path=="/v1/items":
                 q=parse_qs(p.query); manager=q.get("manager",[None])[0]
-                rows=self.store.items(manager,q.get("missing",["0"])[0]=="1",
-                    int(q.get("limit",["100"])[0]),int(q.get("offset",["0"])[0]))
-                return self.send_json(200,{"items":rows})
+                status=q.get("status",["missing" if q.get("missing",["0"])[0]=="1" else "all"])[0]
+                return self.send_json(200,self.store.page(
+                    manager=manager,entity=q.get("entity",["all"])[0],status=status,
+                    search=q.get("search",[""])[0],
+                    limit=int(q.get("limit",["50"])[0]),
+                    offset=int(q.get("offset",["0"])[0])))
             if path.startswith("/v1/image/"):
                 key=self.path_key(path,"/v1/image/")
                 body,mime=self.store.poster(key)

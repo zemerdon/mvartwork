@@ -38,3 +38,26 @@ mvartwork GitHub archive SHA256; an administrator opts in through the API
 Artwork page. This add-on is never auto-installed when upgrading Media Vision
 or the API, and never touches media files. Its state is retained on routine
 upgrades unless the administrator explicitly chooses Delete when uninstalling.
+
+## v0.1.1 — indexed Artwork library browsing
+
+The independent, opt-in MVArtwork component serves bounded, server-paged
+library records from its own SQLite catalogue. GET /v1/items accepts
+manager=series|movie, entity=all|series|season|movie,
+status=all|cached|missing|failed|locked, optional search, limit=1..100
+and bounded offset, returning items, total, offset, limit, hasMore.
+Title and provider-ID search is SQL-parameterized, manager-scoped, and treats
+literal percent and underscore as text, not SQL wildcards.
+
+v0.1.1 additionally accepts an optional title on trusted Series/Movie
+registration. This is presentation metadata only, not identity evidence or
+a title-matching input. Old v0.1.0 records without titles remain usable and
+display their local IDs until registration refresh adds names. The startup
+migration adds only the nullable title column and browse index, preserving
+cached posters, hashes, manual locks, jobs and independent manager identity.
+No bulk provider metadata download occurs and no existing artwork cache is
+removed. Existing Media Vision v1.0.67 clients can still register unchanged.
+
+The Media Vision API Artwork WebUI provides the front-end controls and must
+be updated independently. Deploying this bundle alone does not alter the
+Media Vision app, API software, provider configuration or real media.
