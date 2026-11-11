@@ -18,7 +18,7 @@ from urllib.parse import urlsplit, parse_qs, unquote
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 from urllib.error import HTTPError, URLError
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 ORIGINS = {"artworks.thetvdb.com", "images.thetvdb.com",
            "thetvdb.com", "www.thetvdb.com", "image.tmdb.org"}
 MAX_IMAGE = 12 * 1024 * 1024
@@ -138,11 +138,15 @@ class Store:
             if "title" not in columns:
                 db.execute("ALTER TABLE artwork ADD COLUMN title TEXT")
             db.execute("CREATE INDEX IF NOT EXISTS idx_artwork_browse ON artwork(manager,entity,library_id,season)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_artwork_imdb_reuse ON artwork(manager,entity,season,imdb_id)")
             job_columns={col["name"] for col in db.execute("PRAGMA table_info(jobs)")}
             if "started_at" not in job_columns:
                 db.execute("ALTER TABLE jobs ADD COLUMN started_at REAL")
             # A service crash during download must not strand queue entries.
             db.execute("UPDATE jobs SET state='retry',due=0,started_at=NULL WHERE state='running'")
+            # Repair already-registered missing titles on addon upgrade too,
+            # so the operator need not re-save or rescan the library.
+            self._reuse_verified_imdb_posters(db)
 
     @contextmanager
     def connect(self):
@@ -170,6 +174,29 @@ class Store:
         with self.lock, self.connect() as db:
             db.execute("UPDATE options SET value=? WHERE key='paused'", ("1" if value else "0",))
             db.commit()
+
+    def _reuse_verified_imdb_posters(self, db):
+        missing=db.execute("""SELECT manager,entity,library_id,season,imdb_id
+            FROM artwork WHERE sha256 IS NULL AND pinned=0
+                AND imdb_id IS NOT NULL AND imdb_id<>''""").fetchall()
+        for dest in missing:
+            key=tuple(dest[k] for k in KEYS)
+            matches=db.execute("""SELECT sha256,mime,bytes,pinned FROM artwork
+                WHERE manager=? AND entity=? AND season=? AND library_id<>?
+                    AND imdb_id=? AND sha256 IS NOT NULL""",
+                (key[0],key[1],key[3],key[2],dest["imdb_id"])).fetchall()
+            if len({(row["sha256"],row["mime"]) for row in matches})!=1:
+                continue
+            source=matches[0]
+            if not self._blob(source["sha256"],source["mime"]).is_file():
+                continue
+            db.execute("""UPDATE artwork SET sha256=?,mime=?,bytes=?,pinned=?,
+                updated=?,error=NULL WHERE manager=? AND entity=?
+                AND library_id=? AND season=? AND sha256 IS NULL AND pinned=0""",
+                (source["sha256"],source["mime"],source["bytes"],
+                 source["pinned"],now(),*key))
+            db.execute("""DELETE FROM jobs WHERE manager=? AND entity=?
+                AND library_id=? AND season=?""",key)
 
     def register(self, data):
         key = validated_key(data)
@@ -199,8 +226,116 @@ class Store:
                  source_url=COALESCE(excluded.source_url,artwork.source_url),
                  language=COALESCE(excluded.language,artwork.language),
                  title=COALESCE(excluded.title,artwork.title)""", (*key,*ids,url,language,title))
-            if url and (before is None or before["sha256"] is None) and (before is None or not before["pinned"]):
+            current=db.execute("""SELECT sha256,pinned,imdb_id FROM artwork
+                    WHERE manager=? AND entity=? AND library_id=? AND season=?""",key).fetchone()
+            # IMDb is an actual shared provider identity, not title similarity.
+            # Re-adding a Series after switching metadata source can reuse
+            # the old cached bytes without a new external URL or download.
+            if current["sha256"] is None and not current["pinned"] and current["imdb_id"]:
+                matches=db.execute("""SELECT sha256,mime,bytes,pinned,updated
+                    FROM artwork
+                    WHERE manager=? AND entity=? AND season=?
+                      AND library_id<>? AND imdb_id=?
+                      AND sha256 IS NOT NULL""",
+                    (key[0],key[1],key[3],key[2],current["imdb_id"])).fetchall()
+                # Conflicting cached posters for the same provider identity
+                # need operator selection, never arbitrary first-row wins.
+                unique={(m["sha256"],m["mime"]) for m in matches}
+                if len(unique)==1 and matches:
+                    source=matches[0]
+                    if self._blob(source["sha256"],source["mime"]).is_file():
+                        db.execute("""UPDATE artwork SET sha256=?,mime=?,bytes=?,
+                            pinned=?,updated=?,error=NULL
+                            WHERE manager=? AND entity=? AND library_id=? AND season=?
+                            AND sha256 IS NULL AND pinned=0""",
+                            (source["sha256"],source["mime"],source["bytes"],
+                             source["pinned"],now(),*key))
+                        db.execute("""DELETE FROM jobs WHERE manager=? AND entity=?
+                            AND library_id=? AND season=?""",key)
+            current=db.execute("""SELECT sha256,pinned FROM artwork
+                WHERE manager=? AND entity=? AND library_id=? AND season=?""",key).fetchone()
+            if url and current["sha256"] is None and not current["pinned"]:
                 self._enqueue(db,key)
+            db.commit()
+        return self.item(key)
+
+    def candidates(self, manager, entity, season=-1, search="", limit=20):
+        if manager not in ("series","movie") or entity not in ("series","season","movie") or (
+            (manager=="movie") != (entity=="movie")):
+            raise ValueError("Invalid library manager or poster type.")
+        if type(season) is not int or (entity=="season" and not (0<=season<=10000)) or (
+            entity!="season" and season!=-1):
+            raise ValueError("Invalid season number.")
+        if not isinstance(search,str) or len(search)>120 or any(ord(ch)<32 for ch in search):
+            raise ValueError("Invalid poster search text.")
+        if type(limit) is not int or not (1<=limit<=30):
+            raise ValueError("Invalid poster candidate limit.")
+        term=search.strip().replace("!","!!").replace("%","!%").replace("_","!_")
+        with self.connect() as db:
+            rows=db.execute("""SELECT manager,entity,library_id,season,title,imdb_id,
+                    tvdb_id,tmdb_id,sha256,pinned
+                FROM artwork WHERE manager=? AND entity=? AND season=?
+                    AND sha256 IS NOT NULL
+                    AND (COALESCE(title,'') LIKE ? ESCAPE '!' OR
+                        library_id LIKE ? ESCAPE '!' OR
+                        COALESCE(imdb_id,'') LIKE ? ESCAPE '!')
+                ORDER BY title COLLATE NOCASE, library_id
+                LIMIT ?""",(manager,entity,season,*(["%"+term+"%"]*3),limit)).fetchall()
+        return {"items":[dict(x) for x in rows]}
+
+    def choose_cached(self, data):
+        dest=validated_key(data)
+        source=validated_key({
+            "manager":data.get("source_manager"),"entity":data.get("source_entity"),
+            "library_id":data.get("source_library_id"),
+            "season":data.get("source_season",-1)})
+        if dest[:2]!=source[:2] or dest[3]!=source[3] or dest==source:
+            raise ValueError("Choose a different cached poster of the same library type and season.")
+        with self.lock,self.connect() as db:
+            row=db.execute("""SELECT sha256,mime,bytes FROM artwork
+                WHERE manager=? AND entity=? AND library_id=? AND season=?""",source).fetchone()
+            target=db.execute("""SELECT title FROM artwork WHERE manager=? AND entity=?
+                AND library_id=? AND season=?""",dest).fetchone()
+            if target is None: raise KeyError("Destination is not a registered artwork record.")
+            if row is None or not row["sha256"] or not row["mime"] or not self._blob(
+                row["sha256"],row["mime"]).is_file():
+                raise ValueError("The selected cached poster is no longer available.")
+            db.execute("""UPDATE artwork SET sha256=?,mime=?,bytes=?,pinned=1,
+                updated=?,error=NULL WHERE manager=? AND entity=? AND library_id=? AND season=?""",
+                (row["sha256"],row["mime"],row["bytes"],now(),*dest))
+            db.execute("""DELETE FROM jobs WHERE manager=? AND entity=?
+                AND library_id=? AND season=?""",dest)
+            self._event(db,dest,target["title"],"uploaded",row["bytes"],
+                        detail="Selected from existing cached poster")
+            db.commit()
+        return self.item(dest)
+
+    def download_selected(self, data):
+        key=validated_key(data)
+        url=safe_url(data.get("url"))
+        if not url: raise ValueError("Select an approved HTTPS poster URL.")
+        with self.connect() as db:
+            previous=db.execute("""SELECT sha256,pinned,source_url,imdb_id
+                FROM artwork WHERE manager=? AND entity=? AND library_id=? AND season=?""",key).fetchone()
+        if previous is None: raise KeyError("Destination is not a registered artwork record.")
+        # Fetch before any database mutation: network, oversized data and
+        # invalid images leave the previous poster and its manual lock intact.
+        raw=self.downloader(url)
+        digest,mime,length=self._save_blob(raw)
+        with self.lock,self.connect() as db:
+            target=db.execute("""SELECT sha256,pinned,source_url,imdb_id,title
+                FROM artwork WHERE manager=? AND entity=? AND library_id=? AND season=?""",key).fetchone()
+            if target is None or any(target[k]!=previous[k] for k in
+                ("sha256","pinned","source_url","imdb_id")):
+                raise ValueError("Artwork changed during download; select again.")
+            db.execute("""UPDATE artwork SET sha256=?,mime=?,bytes=?,pinned=1,
+                source_url=?,updated=?,error=NULL
+                WHERE manager=? AND entity=? AND library_id=? AND season=?""",
+                (digest,mime,length,url,now(),*key))
+            db.execute("""DELETE FROM jobs WHERE manager=? AND entity=?
+                AND library_id=? AND season=?""",key)
+            self._event(db,key,target["title"],"uploaded",length,
+                        detail="Downloaded selected approved URL")
             db.commit()
         return self.item(key)
 
@@ -486,6 +621,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200,self.store.activity(
                     manager=q.get("manager",[None])[0],
                     limit=int(q.get("limit",["12"])[0])))
+            if path=="/v1/choices":
+                q=parse_qs(p.query)
+                return self.send_json(200,self.store.candidates(
+                    manager=q.get("manager",[None])[0],
+                    entity=q.get("entity",[None])[0],
+                    season=int(q.get("season",["-1"])[0]),
+                    search=q.get("search",[""])[0],
+                    limit=int(q.get("limit",["20"])[0])))
             if path=="/v1/items":
                 q=parse_qs(p.query); manager=q.get("manager",[None])[0]
                 status=q.get("status",["missing" if q.get("missing",["0"])[0]=="1" else "all"])[0]
@@ -520,6 +663,8 @@ class Handler(BaseHTTPRequestHandler):
             if self.path=="/v1/items": return self.send_json(200,self.store.register(body))
             if self.path=="/v1/titles": return self.send_json(200,self.store.backfill_titles(body))
             if self.path=="/v1/upload": return self.send_json(200,self.store.upload(body))
+            if self.path=="/v1/choose": return self.send_json(200,self.store.choose_cached(body))
+            if self.path=="/v1/download-selected": return self.send_json(200,self.store.download_selected(body))
             if self.path=="/v1/refresh": return self.send_json(200,self.store.enqueue(body))
             if self.path=="/v1/pause":
                 self.store.set_paused(True); return self.send_json(200,self.store.stats())

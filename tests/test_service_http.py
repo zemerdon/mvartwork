@@ -57,6 +57,45 @@ class HttpFixture(unittest.TestCase):
         status,_,body=self.req("POST","/v1/resume",{})
         self.assertEqual(status,200)
         self.assertFalse(json.loads(body)["paused"])
+    def test_selected_poster_http_authentication_and_manager_isolation(self):
+        old={"manager":"series","entity":"series","library_id":"1489",
+             "title":"Example Series","imdb_id":"tt1234567",
+             "source_url":"https://artworks.thetvdb.com/a.jpg"}
+        new={"manager":"series","entity":"series","library_id":"1718",
+             "title":"Example Series","imdb_id":"tt7654321"}
+        for item in (old,new):
+            status,_,_=self.req("POST","/v1/items",item)
+            self.assertEqual(status,200)
+        self.store.process_next()
+        status,_,_=self.req("GET","/v1/choices?manager=series&entity=series&season=-1&search=Example",token="")
+        self.assertEqual(status,401)
+        status,_,body=self.req("GET","/v1/choices?manager=series&entity=series&season=-1&search=Example")
+        self.assertEqual(status,200)
+        items=json.loads(body)["items"]
+        self.assertEqual(len(items),1)
+        self.assertEqual(items[0]["library_id"],"1489")
+        status,_,_=self.req("GET","/v1/choices?manager=movie&entity=movie&search=Example")
+        self.assertEqual(status,200)
+        status,_,body=self.req("POST","/v1/choose",{
+            **{k:new[k] for k in ("manager","entity","library_id")},
+            "source_manager":"series","source_entity":"series","source_library_id":"1489"})
+        self.assertEqual(status,200)
+        self.assertEqual(json.loads(body)["pinned"],1)
+        self.assertEqual(json.loads(body)["sha256"],self.store.item(("series","series","1489",-1))["sha256"])
+        status,_,body=self.req("POST","/v1/choose",{
+            "manager":"movie","entity":"movie","library_id":"1718",
+            "source_manager":"series","source_entity":"series","source_library_id":"1489"})
+        self.assertIn(status,(400,404))
+        status,_,body=self.req("POST","/v1/download-selected",{
+            **{k:new[k] for k in ("manager","entity","library_id")},
+            "url":"https://image.tmdb.org/t/p/original/selected.png"})
+        self.assertEqual(status,200)
+        self.assertEqual(json.loads(body)["pinned"],1)
+        status,_,body=self.req("POST","/v1/download-selected",{
+            **{k:new[k] for k in ("manager","entity","library_id")},
+            "url":"http://127.0.0.1/private"})
+        self.assertEqual(status,400)
+
     def test_paginated_http_filters_and_total(self):
         for i in range(4):
             status,_,body=self.req("POST","/v1/items",

@@ -97,3 +97,30 @@ or forced poster re-download.
 
 The API/Media Vision app remain independent releases. The v0.1.2 component is
 installed only by an explicit action in the API Artwork manager.
+
+
+## v0.1.3 — chosen posters and reused cached identities
+
+New authenticated, bounded private MVArtwork endpoints:
+
+- GET /v1/choices?manager=series&entity=series&season=-1&search=title
+  lists at most 30 already-cached records in the same manager/entity/season.
+- POST /v1/choose selects an existing cached poster for a registered destination,
+  pins the selected bytes without fetching any network content, and retains
+  both records and their original media identities.
+- POST /v1/download-selected accepts a selected, approved HTTPS artwork URL
+  only for an existing registered title/season; validates URL, image bytes and
+  12 MiB size before replacing/pinning poster. Errors preserve the previous
+  poster and lock without any database changes.
+- POST /v1/items can reuse a previous cached poster on library re-addition
+  ONLY for the same manager, entity, season and exact IMDb identity with
+  unambiguous poster hash. It never matches by title resemblance or crosses
+  manager boundaries, and never overwrites a manually pinned poster.
+
+The API administrator Artwork page offers a responsive preview gallery of
+existing cached candidates and explicit Use this poster / Download and lock
+poster controls. Existing data, identities, poster blobs, manual locks, downloads,
+and histories are preserved through the additive upgrade. Upgrade the separate
+MVArtwork component explicitly from the API Updates section after updating the
+independent API product; no live component auto-update occurs on API software
+installation.
