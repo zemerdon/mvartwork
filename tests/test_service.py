@@ -159,3 +159,134 @@ class PagedLibraryFixture(unittest.TestCase):
                    {"search":"a"*121},{"limit":10000},{"offset":-1}):
             with self.assertRaises(ValueError):
                 self.store.page(**kw)
+
+class LiveActivityFixture(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.started=__import__("threading").Event()
+        self.complete=__import__("threading").Event()
+        def download(_):
+            self.started.set()
+            if not self.complete.wait(5):
+                raise TimeoutError("Blocked test download exceeded deadline.")
+            return PNG
+        self.store=Store(self.tmp.name,download)
+        self.store.register({"manager":"series","entity":"season","library_id":"2",
+                             "season":0,"title":"Example Show","source_url":URL})
+        self.store.register({"manager":"movie","entity":"movie","library_id":"5",
+                             "title":"Example Movie","source_url":URL})
+
+    def test_live_active_download_and_per_manager_queue_are_reported(self):
+        from threading import Thread
+        worker=Thread(target=self.store.process_next)
+        worker.start()
+        try:
+            self.assertTrue(self.started.wait(3))
+            snapshot=self.store.activity()
+            self.assertEqual(len(snapshot["active"]),1)
+            self.assertEqual(snapshot["active"][0]["manager"],"series")
+            self.assertEqual(snapshot["active"][0]["title"],"Example Show")
+            self.assertGreater(snapshot["active"][0]["started_at"],0)
+            counts={(row["manager"],row["state"]):row["count"] for row in snapshot["jobs"]}
+            self.assertEqual(counts[("series","running")],1)
+            self.assertEqual(counts[("movie","pending")],1)
+            self.assertEqual(self.store.activity(manager="movie")["active"],[])
+            self.assertEqual(self.store.activity(manager="movie")["recent"],[])
+        finally:
+            self.complete.set()
+            worker.join(timeout=6)
+        self.assertFalse(worker.is_alive())
+        recent=self.store.activity(manager="series")["recent"]
+        self.assertEqual(len(recent),1)
+        self.assertEqual(recent[0]["outcome"],"downloaded")
+        self.assertEqual(recent[0]["bytes"],len(PNG))
+        self.assertEqual(recent[0]["title"],"Example Show")
+        self.assertIsNone(recent[0]["detail"])
+        self.assertNotIn("source_url",recent[0])
+        self.assertNotIn("token",recent[0])
+
+    def test_download_error_records_only_exception_category_not_secret_or_url(self):
+        self.store.downloader=lambda _: (_ for _ in ()).throw(
+            OSError("Do not expose https://artworks.thetvdb.com/secret?token=abc"))
+        self.store.process_next()
+        data=self.store.activity(manager="series")
+        self.assertEqual(data["recent"][0]["outcome"],"retry")
+        self.assertEqual(data["recent"][0]["attempts"],1)
+        self.assertEqual(data["recent"][0]["detail"],"OSError")
+        self.assertNotIn("token",str(data))
+        self.assertNotIn("https://",str(data))
+        self.assertEqual(self.store.activity(manager="movie")["recent"],[])
+
+    def test_v011_db_migration_keeps_all_queued_jobs_and_existing_poster(self):
+        self.complete.set()
+        self.store.process_next()
+        entry=self.store.item(("series","season","2",0))
+        original_hash=entry["sha256"]
+        import sqlite3
+        db=sqlite3.connect(self.tmp.name+"/artwork.sqlite3")
+        db.execute("DROP TABLE events")
+        db.execute("ALTER TABLE jobs DROP COLUMN started_at")
+        db.commit();db.close()
+        reopened=Store(self.tmp.name,lambda _:PNG)
+        self.assertEqual(reopened.item(("series","season","2",0))["sha256"],original_hash)
+        self.assertEqual(reopened.activity()["recent"],[])
+        self.assertEqual(reopened.activity()["jobs"][0]["manager"],"movie")
+
+    def test_manual_upload_wins_against_inflight_download_and_activity_is_truthful(self):
+        from threading import Thread
+        worker=Thread(target=self.store.process_next)
+        worker.start()
+        try:
+            self.assertTrue(self.started.wait(3))
+            art=b"\x89PNG\r\n\x1a\nmanual-upload-replaces-network-data"
+            saved=self.store.upload({"manager":"series","entity":"season",
+                                     "library_id":"2","season":0,
+                                     "base64":base64.b64encode(art).decode()})
+            self.assertEqual(saved["pinned"],1)
+        finally:
+            self.complete.set()
+            worker.join(timeout=6)
+        self.assertFalse(worker.is_alive())
+        after=self.store.item(("series","season","2",0))
+        self.assertEqual(after["sha256"],saved["sha256"])
+        outcomes=[ev["outcome"] for ev in self.store.activity(manager="series")["recent"]]
+        self.assertEqual(outcomes,["uploaded"])
+
+    def test_manual_upload_wins_against_inflight_network_failure(self):
+        from threading import Thread
+        def fail_download(_):
+            self.started.set()
+            self.complete.wait(5)
+            raise OSError("private-uri-secret")
+        self.store.downloader=fail_download
+        worker=Thread(target=self.store.process_next)
+        worker.start()
+        try:
+            self.assertTrue(self.started.wait(3))
+            saved=self.store.upload({"manager":"series","entity":"season",
+                "library_id":"2","season":0,
+                "base64":base64.b64encode(PNG).decode()})
+            self.assertEqual(saved["pinned"],1)
+        finally:
+            self.complete.set()
+            worker.join(timeout=6)
+        self.assertFalse(worker.is_alive())
+        entry=self.store.item(("series","season","2",0))
+        self.assertIsNone(entry["error"])
+        self.assertEqual([ev["outcome"] for ev in
+            self.store.activity(manager="series")["recent"]],["uploaded"])
+
+    def test_bounded_event_log_and_invalid_activity_filter(self):
+        self.complete.set()
+        for n in range(215):
+            self.store.register({"manager":"series","entity":"series","library_id":str(100+n),
+                                 "source_url":URL})
+            self.store.process_next()
+        db_rows=__import__("sqlite3").connect(self.tmp.name+"/artwork.sqlite3").execute(
+            "SELECT COUNT(*) FROM events").fetchone()[0]
+        self.assertEqual(db_rows,200)
+        self.assertLessEqual(len(self.store.activity(limit=25)["recent"]),25)
+        for settings in ({"manager":"unknown"},{"limit":0},{"limit":26},{"limit":"3"}):
+            with self.assertRaises(ValueError):
+                self.store.activity(**settings)

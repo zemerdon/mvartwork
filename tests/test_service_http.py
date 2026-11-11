@@ -75,6 +75,22 @@ class HttpFixture(unittest.TestCase):
         self.assertEqual(status,200)
         self.assertEqual(json.loads(body)["total"],0)
 
+    def test_activity_requires_private_token_and_lists_recent_per_manager(self):
+        item={"manager":"series","entity":"series","library_id":"47",
+              "title":"Test Show","source_url":"https://artworks.thetvdb.com/banners/x.jpg"}
+        self.assertEqual(self.req("POST","/v1/items",item)[0],200)
+        self.assertEqual(self.req("GET","/v1/activity",token="invalid")[0],401)
+        self.store.process_next()
+        status,_,payload=self.req("GET","/v1/activity?manager=series&limit=4")
+        self.assertEqual(status,200)
+        body=json.loads(payload)
+        self.assertEqual(len(body["recent"]),1)
+        self.assertEqual(body["recent"][0]["title"],"Test Show")
+        self.assertEqual(body["recent"][0]["outcome"],"downloaded")
+        self.assertEqual(self.req("GET","/v1/activity?manager=unknown")[0],400)
+        self.assertEqual(self.req("GET","/v1/activity?limit=500")[0],400)
+        self.assertEqual(json.loads(self.req("GET","/v1/activity?manager=movie")[2])["recent"],[])
+
     def test_upload_and_invalid_cross_manager(self):
         status,_,body=self.req("POST","/v1/upload",{
             "manager":"movie","entity":"movie","library_id":"19",

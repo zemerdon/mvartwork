@@ -18,7 +18,7 @@ from urllib.parse import urlsplit, parse_qs, unquote
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 from urllib.error import HTTPError, URLError
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 ORIGINS = {"artworks.thetvdb.com", "images.thetvdb.com",
            "thetvdb.com", "www.thetvdb.com", "image.tmdb.org"}
 MAX_IMAGE = 12 * 1024 * 1024
@@ -43,7 +43,21 @@ CREATE TABLE IF NOT EXISTS jobs (
  manager TEXT NOT NULL, entity TEXT NOT NULL, library_id TEXT NOT NULL,
  season INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
  due REAL NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'pending',
- PRIMARY KEY(manager,entity,library_id,season)
+ started_at REAL, PRIMARY KEY(manager,entity,library_id,season)
+);
+CREATE TABLE IF NOT EXISTS events (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ at TEXT NOT NULL,
+ manager TEXT NOT NULL CHECK(manager IN ('series','movie')),
+ entity TEXT NOT NULL,
+ library_id TEXT NOT NULL,
+ season INTEGER NOT NULL,
+ title TEXT,
+ outcome TEXT NOT NULL CHECK(outcome IN ('downloaded','retry','failed','uploaded')),
+ bytes INTEGER NOT NULL DEFAULT 0,
+ duration_ms INTEGER NOT NULL DEFAULT 0,
+ attempts INTEGER NOT NULL DEFAULT 0,
+ detail TEXT
 );
 CREATE TABLE IF NOT EXISTS options (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 INSERT OR IGNORE INTO options(key,value) VALUES('paused','0');
@@ -124,8 +138,11 @@ class Store:
             if "title" not in columns:
                 db.execute("ALTER TABLE artwork ADD COLUMN title TEXT")
             db.execute("CREATE INDEX IF NOT EXISTS idx_artwork_browse ON artwork(manager,entity,library_id,season)")
+            job_columns={col["name"] for col in db.execute("PRAGMA table_info(jobs)")}
+            if "started_at" not in job_columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN started_at REAL")
             # A service crash during download must not strand queue entries.
-            db.execute("UPDATE jobs SET state='retry',due=0 WHERE state='running'")
+            db.execute("UPDATE jobs SET state='retry',due=0,started_at=NULL WHERE state='running'")
 
     @contextmanager
     def connect(self):
@@ -191,7 +208,7 @@ class Store:
         db.execute("""INSERT INTO jobs(manager,entity,library_id,season,state,due,attempts)
           VALUES(?,?,?,?,'pending',0,0)
           ON CONFLICT(manager,entity,library_id,season) DO UPDATE SET
-          state='pending',due=0,attempts=0""", key)
+          state='pending',due=0,attempts=0,started_at=NULL""", key)
 
     def enqueue(self, data):
         key = validated_key(data)
@@ -239,6 +256,8 @@ class Store:
                 sha256=excluded.sha256,mime=excluded.mime,bytes=excluded.bytes,
                 pinned=1,updated=excluded.updated,error=NULL""",(*key,digest,mime,length,now()))
             db.execute("DELETE FROM jobs WHERE manager=? AND entity=? AND library_id=? AND season=?",key)
+            art=db.execute("SELECT title FROM artwork WHERE manager=? AND entity=? AND library_id=? AND season=?",key).fetchone()
+            self._event(db,key,art["title"] if art else None,"uploaded",length)
             db.commit()
         return self.item(key)
 
@@ -299,6 +318,39 @@ class Store:
         return {"items":[dict(row) for row in rows],"total":total,"offset":offset,
                 "limit":limit,"hasMore":offset+len(rows)<total}
 
+    def _event(self, db, key, title, outcome, length=0, duration_ms=0, attempts=0, detail=None):
+        # No user credentials, provider request URL or raw network exception
+        # text is persisted in the activity feed. Retain only bounded history.
+        db.execute("""INSERT INTO events(at,manager,entity,library_id,season,title,
+                    outcome,bytes,duration_ms,attempts,detail)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                   (now(),*key,title,outcome,int(length),int(duration_ms),int(attempts),detail))
+        db.execute("""DELETE FROM events WHERE id <=
+                      (SELECT MAX(id)-200 FROM events)""")
+
+    def activity(self, manager=None, limit=12):
+        if manager not in (None,"series","movie"):
+            raise ValueError("Invalid activity manager.")
+        if type(limit) is not int or not (1<=limit<=25):
+            raise ValueError("Invalid activity history limit.")
+        with self.lock,self.connect() as db:
+            active=[dict(row) for row in db.execute("""
+                SELECT j.manager,j.entity,j.library_id,j.season,j.attempts,
+                       j.started_at,a.title
+                FROM jobs j JOIN artwork a USING(manager,entity,library_id,season)
+                WHERE j.state='running' AND (? IS NULL OR j.manager=?)
+                ORDER BY j.started_at DESC LIMIT 2""",(manager,manager))]
+            counts=[dict(row) for row in db.execute("""
+                SELECT manager,state,COUNT(*) count FROM jobs
+                WHERE (? IS NULL OR manager=?)
+                GROUP BY manager,state""",(manager,manager))]
+            recent=[dict(row) for row in db.execute("""
+                SELECT id,at,manager,entity,library_id,season,title,outcome,
+                       bytes,duration_ms,attempts,detail
+                FROM events WHERE (? IS NULL OR manager=?)
+                ORDER BY id DESC LIMIT ?""",(manager,manager,limit))]
+        return {"active":active,"jobs":counts,"recent":recent,"paused":self.paused()}
+
     def poster(self,key):
         entry=self.item(key)
         digest,mime=entry["sha256"],entry["mime"]
@@ -328,8 +380,9 @@ class Store:
              WHERE j.state IN ('pending','retry') AND j.due<=? ORDER BY j.due LIMIT 1""",(time.time(),)).fetchone()
             if row is None: return False
             key=tuple(row[k] for k in KEYS)
-            db.execute("UPDATE jobs SET state='running' WHERE manager=? AND entity=? AND library_id=? AND season=?",key)
+            db.execute("UPDATE jobs SET state='running',started_at=? WHERE manager=? AND entity=? AND library_id=? AND season=?", (time.time(),*key))
             db.commit()
+        started=time.monotonic()
         try:
             if row["pinned"] or not row["source_url"]:
                 raise ValueError("Poster is locked or missing its source.")
@@ -337,20 +390,35 @@ class Store:
             digest,mime,length=self._save_blob(data)
             with self.lock,self.connect() as db:
                 # Never replace manual artwork, even if it was uploaded while a job was running.
-                db.execute("""UPDATE artwork SET sha256=?,mime=?,bytes=?,updated=?,error=NULL
+                updated=db.execute("""UPDATE artwork SET sha256=?,mime=?,bytes=?,updated=?,error=NULL
                    WHERE manager=? AND entity=? AND library_id=? AND season=? AND pinned=0""",
                    (digest,mime,length,now(),*key))
                 db.execute("DELETE FROM jobs WHERE manager=? AND entity=? AND library_id=? AND season=?",key)
+                if updated.rowcount:
+                    # A concurrent manual upload may have pinned this image:
+                    # never falsely report the discarded download as saved.
+                    title=db.execute("SELECT title FROM artwork WHERE manager=? AND entity=? AND library_id=? AND season=?",key).fetchone()
+                    self._event(db,key,title["title"] if title else None,"downloaded",
+                                length,round((time.monotonic()-started)*1000),row["attempts"]+1)
                 db.commit()
         except Exception as exc:
             attempts=row["attempts"]+1
             detail=str(exc)[:240] or type(exc).__name__
             with self.lock,self.connect() as db:
-                db.execute("UPDATE artwork SET error=? WHERE manager=? AND entity=? AND library_id=? AND season=?",(detail,*key))
-                db.execute("""UPDATE jobs SET attempts=?,state=?,due=?
-                  WHERE manager=? AND entity=? AND library_id=? AND season=?""",
+                updated=db.execute("""UPDATE jobs SET attempts=?,state=?,due=?,started_at=NULL
+                  WHERE manager=? AND entity=? AND library_id=? AND season=? AND state='running'""",
                   (attempts,"failed" if attempts>=4 else "retry",
                    time.time()+min(3600,30*2**attempts),*key))
+                if updated.rowcount:
+                    db.execute("""UPDATE artwork SET error=? WHERE manager=? AND entity=?
+                        AND library_id=? AND season=? AND pinned=0""",(detail,*key))
+                    title=db.execute("SELECT title FROM artwork WHERE manager=? AND entity=? AND library_id=? AND season=?",key).fetchone()
+                    # Only emit exception category. A manual upload that took
+                    # ownership meanwhile must not acquire spurious errors.
+                    self._event(db,key,title["title"] if title else None,
+                                "failed" if attempts>=4 else "retry",0,
+                                round((time.monotonic()-started)*1000),attempts,
+                                type(exc).__name__)
                 db.commit()
         return True
 
@@ -378,6 +446,11 @@ class Handler(BaseHTTPRequestHandler):
         p=urlsplit(self.path); path=p.path
         try:
             if path=="/v1/status": return self.send_json(200,self.store.stats())
+            if path=="/v1/activity":
+                q=parse_qs(p.query)
+                return self.send_json(200,self.store.activity(
+                    manager=q.get("manager",[None])[0],
+                    limit=int(q.get("limit",["12"])[0])))
             if path=="/v1/items":
                 q=parse_qs(p.query); manager=q.get("manager",[None])[0]
                 status=q.get("status",["missing" if q.get("missing",["0"])[0]=="1" else "all"])[0]

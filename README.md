@@ -61,3 +61,29 @@ removed. Existing Media Vision v1.0.67 clients can still register unchanged.
 The Media Vision API Artwork WebUI provides the front-end controls and must
 be updated independently. Deploying this bundle alone does not alter the
 Media Vision app, API software, provider configuration or real media.
+
+## Development v0.1.2 (not released): live download activity
+
+The optional add-on records a small, bounded activity log without logging
+download URLs, tokens or HTTP request headers. An authenticated
+GET /v1/activity?manager=series|movie&limit=1..25 returns a snapshot of
+current running poster downloads, separate Series and Movie pending/retrying/
+failed queue counts, and up to 25 recent downloaded/retried/failed/uploaded
+events. Each event includes the registered title if available, otherwise the
+local ID, its entity/season, duration and successful image bytes, or the
+exception category only on retry or failure.
+
+The add-on keeps only the last 200 events, so a large library never produces
+unbounded activity storage. The SQLite schema migration from v0.1.1 adds a
+nullable job start-time column and a separate activity table without changing
+original artwork rows, hashes, blob files, manual locks, registration IDs or
+queue records. On process restart any interrupted job is returned to the
+existing retry queue and its stale active timestamp is cleared.
+
+The independent Media Vision API UI candidate provides the desktop two-column
+artwork list, independent Series+Seasons and Movies missing counters, and
+live activity panel with bounded four-second polling. The API does not expose
+the activity endpoint on the client metadata port 9292.
+
+No public releases or installed service updates are part of this development
+candidate until separately authorized.
