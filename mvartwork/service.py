@@ -318,6 +318,37 @@ class Store:
         return {"items":[dict(row) for row in rows],"total":total,"offset":offset,
                 "limit":limit,"hasMore":offset+len(rows)<total}
 
+    def backfill_titles(self, data):
+        # Repair display metadata for EXISTING registered IDs only. This
+        # never creates poster entries, updates provider IDs, alters poster
+        # hashes/pins or adds/reschedules a single download job.
+        if not isinstance(data, dict) or data.get("manager") not in ("series", "movie"):
+            raise ValueError("Series or movie manager is required.")
+        manager=data["manager"]
+        titles=data.get("titles")
+        if not isinstance(titles,list) or not (1<=len(titles)<=200):
+            raise ValueError("Provide between 1 and 200 title entries.")
+        clean=[];unique=set()
+        for row in titles:
+            if not isinstance(row,dict) or set(row)!={"library_id","title"}:
+                raise ValueError("Each title must include local ID and title.")
+            key=row["library_id"];title=row["title"]
+            if not isinstance(key,str) or not ID_RE.fullmatch(key) or key in unique:
+                raise ValueError("Invalid or duplicate library ID.")
+            if not isinstance(title,str) or not title.strip() or len(title)>300 or any(ord(c)<32 for c in title):
+                raise ValueError("Invalid artwork display title.")
+            unique.add(key);clean.append((title.strip(),manager,key))
+        updated=0
+        with self.lock,self.connect() as db:
+            for title,scope,local_id in clean:
+                changed=db.execute("""UPDATE artwork SET title=?
+                    WHERE manager=? AND library_id=?
+                    AND (title IS NULL OR title<>?)""",
+                    (title,scope,local_id,title))
+                updated+=changed.rowcount
+            db.commit()
+        return {"manager":manager,"submitted":len(clean),"updated":updated}
+
     def _event(self, db, key, title, outcome, length=0, duration_ms=0, attempts=0, detail=None):
         # No user credentials, provider request URL or raw network exception
         # text is persisted in the activity feed. Retain only bounded history.
@@ -345,10 +376,14 @@ class Store:
                 WHERE (? IS NULL OR manager=?)
                 GROUP BY manager,state""",(manager,manager))]
             recent=[dict(row) for row in db.execute("""
-                SELECT id,at,manager,entity,library_id,season,title,outcome,
-                       bytes,duration_ms,attempts,detail
-                FROM events WHERE (? IS NULL OR manager=?)
-                ORDER BY id DESC LIMIT ?""",(manager,manager,limit))]
+                SELECT e.id,e.at,e.manager,e.entity,e.library_id,e.season,
+                       COALESCE(a.title,e.title) title,e.outcome,
+                       e.bytes,e.duration_ms,e.attempts,e.detail
+                FROM events e LEFT JOIN artwork a
+                 ON e.manager=a.manager AND e.entity=a.entity AND
+                    e.library_id=a.library_id AND e.season=a.season
+                WHERE (? IS NULL OR e.manager=?)
+                ORDER BY e.id DESC LIMIT ?""",(manager,manager,limit))]
         return {"active":active,"jobs":counts,"recent":recent,"paused":self.paused()}
 
     def poster(self,key):
@@ -483,6 +518,7 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(body,dict): return self.send_json(400,{"error":"Expected object."})
         try:
             if self.path=="/v1/items": return self.send_json(200,self.store.register(body))
+            if self.path=="/v1/titles": return self.send_json(200,self.store.backfill_titles(body))
             if self.path=="/v1/upload": return self.send_json(200,self.store.upload(body))
             if self.path=="/v1/refresh": return self.send_json(200,self.store.enqueue(body))
             if self.path=="/v1/pause":

@@ -290,3 +290,81 @@ class LiveActivityFixture(unittest.TestCase):
         for settings in ({"manager":"unknown"},{"limit":0},{"limit":26},{"limit":"3"}):
             with self.assertRaises(ValueError):
                 self.store.activity(**settings)
+
+
+class BulkTitleBackfillFixture(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store=Store(self.temp.name,lambda _:PNG)
+        self.series={"manager":"series","entity":"series","library_id":"1002",
+                     "source_url":URL}
+        self.season={"manager":"series","entity":"season","season":0,
+                     "library_id":"1002","source_url":URL}
+        self.movie={"manager":"movie","entity":"movie","library_id":"1002",
+                    "source_url":URL}
+        for item in (self.series,self.season,self.movie):
+            self.store.register(item)
+
+    def test_backfill_names_same_series_id_and_all_seasons_without_cross_manager_mixup(self):
+        result=self.store.backfill_titles({"manager":"series",
+            "titles":[{"library_id":"1002","title":"The Original Series"}]})
+        self.assertEqual(result,{"manager":"series","submitted":1,"updated":2})
+        self.assertEqual(self.store.item(("series","series","1002",-1))["title"],"The Original Series")
+        self.assertEqual(self.store.item(("series","season","1002",0))["title"],"The Original Series")
+        self.assertIsNone(self.store.item(("movie","movie","1002",-1))["title"])
+        movie=self.store.backfill_titles({"manager":"movie",
+            "titles":[{"library_id":"1002","title":"Movie with Same Local ID"}]})
+        self.assertEqual(movie["updated"],1)
+        self.assertEqual(self.store.item(("movie","movie","1002",-1))["title"],"Movie with Same Local ID")
+        self.assertEqual(self.store.page(manager="series",search="Original")["total"],2)
+        self.assertEqual(self.store.page(manager="movie",search="Original")["total"],0)
+        self.assertEqual(self.store.backfill_titles({"manager":"series",
+            "titles":[{"library_id":"1002","title":"The Original Series"}]})["updated"],0)
+
+    def test_backfill_preserves_queue_pins_hash_and_never_creates_entries(self):
+        self.store.process_next()
+        self.store.upload({"manager":"series","entity":"season",
+                           "library_id":"1002","season":0,
+                           "base64":base64.b64encode(PNG).decode()})
+        import sqlite3
+        conn=sqlite3.connect(self.temp.name+"/artwork.sqlite3")
+        before=conn.execute("SELECT manager,entity,library_id,season,state,attempts,due FROM jobs ORDER BY manager,entity").fetchall()
+        hashes=conn.execute("SELECT manager,entity,library_id,season,sha256,pinned FROM artwork ORDER BY manager,entity").fetchall()
+        conn.close()
+        r=self.store.backfill_titles({"manager":"series","titles":[
+          {"library_id":"1002","title":"Name"},
+          {"library_id":"9999","title":"Unregistered ID"}]})
+        self.assertEqual(r["updated"],2)
+        conn=sqlite3.connect(self.temp.name+"/artwork.sqlite3")
+        self.assertEqual(conn.execute("SELECT manager,entity,library_id,season,state,attempts,due FROM jobs ORDER BY manager,entity").fetchall(),before)
+        self.assertEqual(conn.execute("SELECT manager,entity,library_id,season,sha256,pinned FROM artwork ORDER BY manager,entity").fetchall(),hashes)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM artwork").fetchone()[0],3)
+        conn.close()
+
+    def test_historical_download_activity_displays_backfilled_series_title(self):
+        self.store.process_next()
+        original=self.store.activity(manager="series")["recent"]
+        self.assertEqual(len(original),1)
+        self.assertIsNone(original[0]["title"])
+        self.assertEqual(self.store.backfill_titles({"manager":"series",
+            "titles":[{"library_id":"1002","title":"Retroactively Named Show"}]})["updated"],2)
+        labelled=self.store.activity(manager="series")["recent"]
+        self.assertEqual(labelled[0]["title"],"Retroactively Named Show")
+        self.assertEqual(labelled[0]["id"],original[0]["id"])
+        self.assertEqual(labelled[0]["bytes"],original[0]["bytes"])
+
+    def test_reject_invalid_or_malicious_bulk_without_any_partial_update(self):
+        for bad in (
+            {"manager":"other","titles":[{"library_id":"1002","title":"Bad"}]},
+            {"manager":"series","titles":[]},
+            {"manager":"series","titles":[{"library_id":"1002","title":"Bad"}]*201},
+            {"manager":"series","titles":[{"library_id":"1002","title":"OK"},{"library_id":"1002","title":"Duplicate"}]},
+            {"manager":"series","titles":[{"library_id":"1002","title":"Good"},{"library_id":"1003","title":"\nBad"}]},
+            {"manager":"series","titles":[{"library_id":"1002","title":"a"*301}]},
+            {"manager":"series","titles":[{"library_id":"1002","title":"x","source_url":URL}]},
+            {"manager":"series","titles":"not a list"},
+        ):
+            with self.assertRaises(ValueError):
+                self.store.backfill_titles(bad)
+            self.assertIsNone(self.store.item(("series","series","1002",-1))["title"])

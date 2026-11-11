@@ -62,7 +62,7 @@ The Media Vision API Artwork WebUI provides the front-end controls and must
 be updated independently. Deploying this bundle alone does not alter the
 Media Vision app, API software, provider configuration or real media.
 
-## Development v0.1.2 (not released): live download activity
+## v0.1.2 — live poster download activity and safe title-only backfill
 
 The optional add-on records a small, bounded activity log without logging
 download URLs, tokens or HTTP request headers. An authenticated
@@ -85,5 +85,15 @@ artwork list, independent Series+Seasons and Movies missing counters, and
 live activity panel with bounded four-second polling. The API does not expose
 the activity endpoint on the client metadata port 9292.
 
-No public releases or installed service updates are part of this development
-candidate until separately authorized.
+MVArtwork v0.1.2 also accepts authenticated POST /v1/titles with manager=
+series|movie and 1–200 library ID/title pairs. The server validates the
+entire request before a transaction, then updates the optional display title
+for EXISTING registered rows only, across all seasons of a Series. An ID
+belonging to the other manager never changes. Nothing is registered, queued,
+downloaded or relinked; poster hashes, pins, media and original provider IDs
+are untouched. This permits the separately updated Media Vision app to fill
+historic local-ID labels automatically, in bounded batches, without a button
+or forced poster re-download.
+
+The API/Media Vision app remain independent releases. The v0.1.2 component is
+installed only by an explicit action in the API Artwork manager.

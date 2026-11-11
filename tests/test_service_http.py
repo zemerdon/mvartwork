@@ -91,6 +91,20 @@ class HttpFixture(unittest.TestCase):
         self.assertEqual(self.req("GET","/v1/activity?limit=500")[0],400)
         self.assertEqual(json.loads(self.req("GET","/v1/activity?manager=movie")[2])["recent"],[])
 
+    def test_bulk_title_backfill_private_api_requires_auth_and_preserves_local_id(self):
+        status,_,_=self.req("POST","/v1/items",
+            {"manager":"series","entity":"season","season":0,"library_id":"1002"})
+        self.assertEqual(status,200)
+        payload={"manager":"series","titles":[{"library_id":"1002","title":"The Show"}]}
+        self.assertEqual(self.req("POST","/v1/titles",payload,token="wrong")[0],401)
+        status,_,body=self.req("POST","/v1/titles",payload)
+        self.assertEqual(status,200)
+        self.assertEqual(json.loads(body)["updated"],1)
+        status,_,body=self.req("GET","/v1/items?manager=series&search=The%20Show")
+        self.assertEqual(status,200)
+        self.assertEqual(json.loads(body)["items"][0]["title"],"The Show")
+        self.assertEqual(self.req("POST","/v1/titles",{"manager":"movie","titles":[]})[0],400)
+
     def test_upload_and_invalid_cross_manager(self):
         status,_,body=self.req("POST","/v1/upload",{
             "manager":"movie","entity":"movie","library_id":"19",
