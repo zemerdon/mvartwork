@@ -18,7 +18,7 @@ from urllib.parse import urlsplit, parse_qs, unquote
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 from urllib.error import HTTPError, URLError
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 ORIGINS = {"artworks.thetvdb.com", "images.thetvdb.com",
            "thetvdb.com", "www.thetvdb.com", "image.tmdb.org"}
 MAX_IMAGE = 12 * 1024 * 1024
@@ -61,6 +61,14 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE TABLE IF NOT EXISTS options (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 INSERT OR IGNORE INTO options(key,value) VALUES('paused','0');
+INSERT OR IGNORE INTO options(key,value) VALUES('auto_sync','1');
+INSERT OR IGNORE INTO options(key,value) VALUES('sync_request_id','0');
+CREATE TABLE IF NOT EXISTS library_snapshot (
+ manager TEXT NOT NULL CHECK(manager IN ('series','movie')),
+ entity TEXT NOT NULL, library_id TEXT NOT NULL, season INTEGER NOT NULL,
+ PRIMARY KEY(manager,entity,library_id,season)
+);
+
 """
 
 def now():
@@ -258,6 +266,92 @@ class Store:
                 self._enqueue(db,key)
             db.commit()
         return self.item(key)
+
+    def library_status(self):
+        with self.lock,self.connect() as db:
+            opts=dict(db.execute("SELECT key,value FROM options WHERE key IN ('auto_sync','sync_request_id','synced_series','synced_movie','completed_series','completed_movie')"))
+            counts={manager:db.execute("SELECT count(*) FROM library_snapshot WHERE manager=?",
+                                     (manager,)).fetchone()[0] for manager in ("series","movie")}
+        return {"autoSync":opts.get("auto_sync","1")=="1",
+                "requestId":int(opts.get("sync_request_id","0")),
+                "completed":{"series":int(opts.get("completed_series","0")),
+                             "movie":int(opts.get("completed_movie","0"))},
+                "snapshots":counts,
+                "lastSynced":{"series":opts.get("synced_series"),
+                              "movie":opts.get("synced_movie")}}
+
+    def request_library_sync(self):
+        with self.lock,self.connect() as db:
+            row=db.execute("SELECT value FROM options WHERE key='sync_request_id'").fetchone()
+            next_id=int(row[0] if row else "0")+1
+            db.execute("INSERT INTO options(key,value) VALUES('sync_request_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(next_id),))
+        return self.library_status()
+
+    def set_auto_sync(self, enabled):
+        if type(enabled) is not bool: raise ValueError("Auto Sync must be Boolean.")
+        with self.lock,self.connect() as db:
+            db.execute("INSERT INTO options(key,value) VALUES('auto_sync',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",("1" if enabled else "0",))
+        return self.library_status()
+
+    def receive_library_snapshot(self, data):
+        if not isinstance(data,dict) or data.get("manager") not in ("series","movie") or data.get("complete") is not True:
+            raise ValueError("A verified complete manager library snapshot is required.")
+        manager=data["manager"];records=data.get("records")
+        if not isinstance(records,list) or not (1<=len(records)<=50000):
+            raise ValueError("A complete, nonempty library snapshot is required.")
+        unique=set()
+        for row in records:
+            if not isinstance(row,dict) or set(row)!={"entity","library_id","season"}:
+                raise ValueError("Malformed library ID record.")
+            key=validated_key({"manager":manager,**row})
+            if key in unique:raise ValueError("Duplicate library ID in snapshot.")
+            unique.add(key)
+        with self.lock,self.connect() as db:
+            db.execute("DELETE FROM library_snapshot WHERE manager=?",(manager,))
+            db.executemany("INSERT INTO library_snapshot(manager,entity,library_id,season) VALUES(?,?,?,?)",sorted(unique))
+            db.execute("INSERT INTO options(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",("synced_"+manager,now()))
+            row=db.execute("SELECT value FROM options WHERE key='sync_request_id'").fetchone()
+            db.execute("INSERT INTO options(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",("completed_"+manager,row[0] if row else "0"))
+        return {"manager":manager,"count":len(unique),"complete":True}
+
+    def remove_stale_artwork(self):
+        from datetime import timedelta
+        threshold=datetime.now(timezone.utc)-timedelta(minutes=60)
+        with self.lock,self.connect() as db:
+            opts=dict(db.execute("SELECT key,value FROM options WHERE key IN ('synced_series','synced_movie','sync_request_id','completed_series','completed_movie')"))
+            managers=[]
+            for manager in ("series","movie"):
+                value=opts.get("synced_"+manager)
+                if value:
+                    try:
+                        dt=datetime.fromisoformat(value)
+                        if dt.tzinfo and dt>=threshold: managers.append(manager)
+                    except ValueError: pass
+            if not managers:raise ValueError("Sync Library before removing stale artwork.")
+            latest=int(opts.get("sync_request_id","0"))
+            if latest>0 and any(int(opts.get("completed_"+manager,"0"))<latest for manager in managers):
+                raise ValueError("Complete the requested Sync Library operation before removing stale artwork.")
+            stale=[];total=0
+            for manager in managers:
+                total+=db.execute("SELECT count(*) FROM artwork WHERE manager=?",(manager,)).fetchone()[0]
+                stale+=db.execute("""SELECT manager,entity,library_id,season,sha256,mime FROM artwork a
+                    WHERE manager=? AND NOT EXISTS (SELECT 1 FROM library_snapshot s
+                    WHERE s.manager=a.manager AND s.entity=a.entity
+                      AND s.library_id=a.library_id AND s.season=a.season)""",(manager,)).fetchall()
+            if len(stale)>max(20,int(total*.30)):
+                raise ValueError("Stale count exceeds safe cleanup limits; verify the source library.")
+            for row in stale:
+                key=tuple(row[k] for k in KEYS)
+                db.execute("DELETE FROM jobs WHERE manager=? AND entity=? AND library_id=? AND season=?",key)
+                db.execute("DELETE FROM artwork WHERE manager=? AND entity=? AND library_id=? AND season=?",key)
+            blobs=set()
+            for row in stale:
+                if row["sha256"] and row["mime"] and db.execute("SELECT count(*) FROM artwork WHERE sha256=?",(row["sha256"],)).fetchone()[0]==0:
+                    blob=self._blob(row["sha256"],row["mime"])
+                    if blob.is_file() and not blob.is_symlink():blobs.add(blob)
+            db.commit()
+            for blob in blobs: blob.unlink(missing_ok=True)
+        return {"removedRecords":len(stale),"removedBlobs":len(blobs),"managers":managers,"untouchedMedia":True}
 
     def candidates(self, manager, entity, season=-1, search="", limit=20):
         if manager not in ("series","movie") or entity not in ("series","season","movie") or (
@@ -616,6 +710,7 @@ class Handler(BaseHTTPRequestHandler):
         p=urlsplit(self.path); path=p.path
         try:
             if path=="/v1/status": return self.send_json(200,self.store.stats())
+            if path=="/v1/library/status": return self.send_json(200,self.store.library_status())
             if path=="/v1/export":
                 from mvartwork.backup import create_backup
                 archive,size,counts=create_backup(self.store)
@@ -707,6 +802,10 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError,UnicodeDecodeError): return self.send_json(400,{"error":"Invalid JSON."})
         if not isinstance(body,dict): return self.send_json(400,{"error":"Expected object."})
         try:
+            if self.path=="/v1/library/request": return self.send_json(200,self.store.request_library_sync())
+            if self.path=="/v1/library/options": return self.send_json(200,self.store.set_auto_sync(body.get("enabled")))
+            if self.path=="/v1/library/snapshot": return self.send_json(200,self.store.receive_library_snapshot(body))
+            if self.path=="/v1/library/remove-stale": return self.send_json(200,self.store.remove_stale_artwork())
             if self.path=="/v1/items": return self.send_json(200,self.store.register(body))
             if self.path=="/v1/titles": return self.send_json(200,self.store.backfill_titles(body))
             if self.path=="/v1/upload": return self.send_json(200,self.store.upload(body))

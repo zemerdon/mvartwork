@@ -1,3 +1,14 @@
+## v0.1.5 — safe library synchronization and stale artwork cleanup
+
+- Complete, manager-scoped library snapshots submitted only by the authenticated Media Vision client after successful full registration.
+- Manual Sync Library request, Auto Sync preference and independently verified sync status.
+- Operator-triggered Remove Stale Artwork requires fresh, complete snapshots, refuses pending sync and mass-deletion anomalies, deletes only orphan registrations and unreferenced cached image blobs, and never touches real media.
+- Series, Season and Movie IDs remain separate; no title or year guessing.
+
+Develop prerelease only. Previous v0.1.4 backups and safe-merge support remain available.
+
+---
+
 ## v0.1.4 — portable artwork export and safe import
 
 The independent MVArtwork service now offers two authenticated

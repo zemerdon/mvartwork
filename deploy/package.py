@@ -12,7 +12,7 @@ paths = [Path("mvartwork/__init__.py"),Path("mvartwork/__main__.py"),
          Path("mvartwork/service.py"),Path("mvartwork/backup.py"),Path("deploy/install.py"),Path("README.md")]
 out = Path(sys.argv[1]) if len(sys.argv)>1 else root/"dist"
 out.mkdir(parents=True,exist_ok=True)
-bundle=out/"mvartwork-0.1.4.tar.gz"
+bundle=out/"mvartwork-0.1.5.tar.gz"
 with bundle.open("wb") as raw, gzip.GzipFile(fileobj=raw,mode="wb",mtime=0,filename="") as gz:
     with tarfile.open(fileobj=gz,mode="w") as tar:
         for rel in paths:
@@ -22,7 +22,7 @@ with bundle.open("wb") as raw, gzip.GzipFile(fileobj=raw,mode="wb",mtime=0,filen
             info.uid=info.gid=0;info.uname=info.gname=""
             tar.addfile(info,io.BytesIO(data))
 digest=hashlib.sha256(bundle.read_bytes()).hexdigest()
-manifest={"name":"mvartwork","version":"0.1.4","file":bundle.name,
+manifest={"name":"mvartwork","version":"0.1.5","file":bundle.name,
           "sha256":digest,"size":bundle.stat().st_size,
           "release":True}
 (out/"mvartwork-manifest.json").write_text(json.dumps(manifest,indent=2)+"\n")
