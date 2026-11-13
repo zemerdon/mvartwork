@@ -20,10 +20,10 @@ class PackageTests(unittest.TestCase):
             self.assertEqual(left.read_bytes(),right.read_bytes())
             manifest=json.loads((Path(a)/"mvartwork-manifest.json").read_text())
             self.assertEqual(manifest["sha256"],hashlib.sha256(left.read_bytes()).hexdigest())
-            self.assertEqual(manifest["version"],"0.1.3")
+            self.assertEqual(manifest["version"],"0.1.4")
             self.assertTrue(manifest["release"])
-            self.assertEqual(left.name,"mvartwork-0.1.3.tar.gz")
-            self.assertEqual(len(verified_files(left,manifest["sha256"])),5)
+            self.assertEqual(left.name,"mvartwork-0.1.4.tar.gz")
+            self.assertEqual(len(verified_files(left,manifest["sha256"])),6)
             with self.assertRaisesRegex(ValueError,"SHA256 mismatch"):
                 verified_files(left,"0"*64)
 

@@ -1,3 +1,33 @@
+## v0.1.4 — portable artwork export and safe import
+
+The independent MVArtwork service now offers two authenticated
+loopback-only operations (never on the public client API port):
+
+- GET /v1/export returns a portable ZIP of a consistent
+  artwork.sqlite3 snapshot and verified cached poster blobs.
+  It includes both independent Series/Seasons and Movies entries,
+  cached posters and manual locks. API keys, metadata indexes,
+  configuration secrets and software packages are excluded.
+- POST /v1/import accepts that ZIP with an explicit safe-merge
+  header. A bounded, strongly validated archive must pass
+  SHA-256 verification for its catalogue and every poster before
+  any catalogue changes. The merge never replaces an existing
+  poster or manual lock, and declines conflicted provider
+  identities rather than assuming a library-local ID is safe.
+  Imported new records retain their poster identity and manual
+  lock. New missing entries are registered for later scans.
+  Running download jobs and queue history remain local.
+  Repeated import is idempotent.
+
+A 4 GiB archive limit, per-image 12 MiB limit, maximum 100k blobs,
+strict archive names (no traversal, symlinks or compression), and
+atomic SQLite record transactions apply. The API WebUI separately
+authenticates the administrator/CSRF session and streams the backup
+with no full archive held in memory.
+
+The previous v0.1.3 releases remain available independently for
+rollback. Release v0.1.4 is Develop prerelease, not Stable/latest.
+
 # mvartwork — optional Media Vision artwork component
 
 Independent, optional native artwork cache for **library entries only**. No TVDB catalogue mirror.

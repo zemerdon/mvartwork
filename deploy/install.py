@@ -28,7 +28,7 @@ TOKEN=Path("/var/lib/series-vision-metadata/mvartwork-token")
 UNIT=Path("/etc/systemd/system/mvartwork.service")
 SERVICE_USER="seriesvision-metadata"
 FILES={"mvartwork/__init__.py","mvartwork/__main__.py",
-       "mvartwork/service.py","deploy/install.py","README.md"}
+       "mvartwork/service.py","mvartwork/backup.py","deploy/install.py","README.md"}
 SERVICE="""[Unit]
 Description=Optional Media Vision Artwork Cache
 Wants=network-online.target

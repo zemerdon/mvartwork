@@ -18,7 +18,7 @@ from urllib.parse import urlsplit, parse_qs, unquote
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 from urllib.error import HTTPError, URLError
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 ORIGINS = {"artworks.thetvdb.com", "images.thetvdb.com",
            "thetvdb.com", "www.thetvdb.com", "image.tmdb.org"}
 MAX_IMAGE = 12 * 1024 * 1024
@@ -616,6 +616,25 @@ class Handler(BaseHTTPRequestHandler):
         p=urlsplit(self.path); path=p.path
         try:
             if path=="/v1/status": return self.send_json(200,self.store.stats())
+            if path=="/v1/export":
+                from mvartwork.backup import create_backup
+                archive,size,counts=create_backup(self.store)
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type","application/zip")
+                    self.send_header("Content-Disposition",
+                        'attachment; filename="mvartwork-backup.zip"')
+                    self.send_header("Cache-Control","no-store")
+                    self.send_header("Content-Length",str(size))
+                    self.send_header("X-MVArtwork-Backup-Format","mvartwork-backup-v1")
+                    self.end_headers()
+                    while True:
+                        chunk=archive.read(1024*1024)
+                        if not chunk:break
+                        self.wfile.write(chunk)
+                finally:
+                    archive.close()
+                return
             if path=="/v1/activity":
                 q=parse_qs(p.query)
                 return self.send_json(200,self.store.activity(
@@ -653,6 +672,34 @@ class Handler(BaseHTTPRequestHandler):
         return validated_key(dict(zip(KEYS,(segments[0],segments[1],segments[2],int(segments[3])))))
     def do_POST(self):
         if not self.authorized(): return self.send_json(401,{"error":"Unauthorized"})
+        if self.path=="/v1/import":
+            from mvartwork.backup import merge_backup,MAX_BACKUP
+            import tempfile
+            import zipfile
+            length=self.headers.get("Content-Length")
+            if (self.headers.get("Content-Type","").split(";")[0].strip()!="application/zip"
+                or not length or not length.isdigit() or not 100<=int(length)<=MAX_BACKUP):
+                return self.send_json(413,{"error":"Invalid or oversized MVArtwork backup upload."})
+            if self.headers.get("X-MVArtwork-Import-Mode")!="safe-merge":
+                return self.send_json(400,{"error":"Explicit safe-merge import mode required."})
+            try:
+                # Stream the incoming ZIP straight to a private, automatically
+                # unlinked staging file. Never duplicate or buffer a 4 GiB
+                # upload in RAM or retain an unverified archive on disk.
+                with tempfile.NamedTemporaryFile(prefix=".mvartwork-import-upload-",
+                    suffix=".zip",dir=self.store.folder,delete=True) as staged:
+                    remaining=int(length)
+                    while remaining:
+                        chunk=self.rfile.read(min(1024*1024,remaining))
+                        if not chunk:raise ValueError("Incomplete uploaded archive.")
+                        remaining-=len(chunk)
+                        staged.write(chunk)
+                    staged.flush()
+                    return self.send_json(200,merge_backup(self.store,Path(staged.name)))
+            except (ValueError,zipfile.BadZipFile,sqlite3.DatabaseError) as exc:
+                return self.send_json(400,{"error":str(exc)[:240]})
+            except OSError:
+                return self.send_json(503,{"error":"Artwork backup import unavailable; cache unchanged."})
         length=self.headers.get("Content-Length")
         if not length or not length.isdigit() or int(length)>MAX_JSON:
             return self.send_json(413,{"error":"Request too large."})
