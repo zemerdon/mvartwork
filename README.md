@@ -1,3 +1,10 @@
+# MVArtwork v0.2.0 Stable
+
+First Stable release of MVArtwork based on the verified Develop v0.1.5
+library sync, portable backup, poster selection and safe stale cache
+cleanup. No automatic sync, deletion or installed instance changes
+are performed by publishing a software release.
+
 ## v0.1.5 — safe library synchronization and stale artwork cleanup
 
 - Complete, manager-scoped library snapshots submitted only by the authenticated Media Vision client after successful full registration.
