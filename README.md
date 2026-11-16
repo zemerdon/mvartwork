@@ -1,9 +1,17 @@
 # MVArtwork v0.2.0 Stable
 
-First Stable release of MVArtwork based on the verified Develop v0.1.5
-library sync, portable backup, poster selection and safe stale cache
-cleanup. No automatic sync, deletion or installed instance changes
-are performed by publishing a software release.
+**Stable is the only supported public update and release channel.**
+Develop releases are retired and retained strictly as historical archives.
+MVArtwork v0.2.0, Media Vision API v0.2.0, and Core v1.5.0 have
+independent GitHub software sources, versions, installers and rollback
+mechanisms. Software publication never changes installed services,
+cached images, databases, or real media.
+
+This first Stable version retains the independently verified v0.1.5
+library synchronization, portable backup, poster selection and safe
+stale-cache cleanup functionality.
+
+## Historical prerelease changelog (archived, not active channels)
 
 ## v0.1.5 — safe library synchronization and stale artwork cleanup
 
@@ -12,7 +20,8 @@ are performed by publishing a software release.
 - Operator-triggered Remove Stale Artwork requires fresh, complete snapshots, refuses pending sync and mass-deletion anomalies, deletes only orphan registrations and unreferenced cached image blobs, and never touches real media.
 - Series, Season and Movie IDs remain separate; no title or year guessing.
 
-Develop prerelease only. Previous v0.1.4 backups and safe-merge support remain available.
+Historical v0.1.5 was a Develop prerelease; its features are included
+in Stable v0.2.0. Previous backup compatibility remains preserved.
 
 ---
 
@@ -43,8 +52,9 @@ atomic SQLite record transactions apply. The API WebUI separately
 authenticates the administrator/CSRF session and streams the backup
 with no full archive held in memory.
 
-The previous v0.1.3 releases remain available independently for
-rollback. Release v0.1.4 is Develop prerelease, not Stable/latest.
+Earlier v0.1.3/v0.1.4 historical release archives remain available
+for reference and explicitly tested restoration; v0.1.4 was a Develop
+prerelease before Stable v0.2.0 superseded it.
 
 # mvartwork — optional Media Vision artwork component
 
@@ -81,9 +91,9 @@ explicitly registered by an authorized Media Vision library client are cached.
 The tagged release archive is built reproducibly with
 `python3 deploy/package.py dist`. Its SHA256 and size are recorded in
 `dist/mvartwork-manifest.json`; an installer refuses any mismatched bundle.
-Media Vision API's separately versioned Develop release pins the public
-mvartwork GitHub archive SHA256; an administrator opts in through the API
-Artwork page. This add-on is never auto-installed when upgrading Media Vision
+Media Vision API's independently released Stable v0.2.0 pins the
+public MVArtwork Stable v0.2.0 archive SHA256; the administrator
+controls installation and upgrades in the API Artwork page. This add-on is never auto-installed when upgrading Media Vision
 or the API, and never touches media files. Its state is retained on routine
 upgrades unless the administrator explicitly chooses Delete when uninstalling.
 
