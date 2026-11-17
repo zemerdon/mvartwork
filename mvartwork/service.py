@@ -18,7 +18,7 @@ from urllib.parse import urlsplit, parse_qs, unquote
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 from urllib.error import HTTPError, URLError
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 ORIGINS = {"artworks.thetvdb.com", "images.thetvdb.com",
            "thetvdb.com", "www.thetvdb.com", "image.tmdb.org"}
 MAX_IMAGE = 12 * 1024 * 1024
@@ -269,7 +269,7 @@ class Store:
 
     def library_status(self):
         with self.lock,self.connect() as db:
-            opts=dict(db.execute("SELECT key,value FROM options WHERE key IN ('auto_sync','sync_request_id','synced_series','synced_movie','completed_series','completed_movie')"))
+            opts=dict(db.execute("SELECT key,value FROM options WHERE key IN ('auto_sync','sync_request_id','synced_series','synced_movie','completed_series','completed_movie','snapshot_delta_series','snapshot_delta_movie')"))
             counts={manager:db.execute("SELECT count(*) FROM library_snapshot WHERE manager=?",
                                      (manager,)).fetchone()[0] for manager in ("series","movie")}
         return {"autoSync":opts.get("auto_sync","1")=="1",
@@ -278,7 +278,58 @@ class Store:
                              "movie":int(opts.get("completed_movie","0"))},
                 "snapshots":counts,
                 "lastSynced":{"series":opts.get("synced_series"),
-                              "movie":opts.get("synced_movie")}}
+                              "movie":opts.get("synced_movie")},
+                "changes":{manager:json.loads(opts.get("snapshot_delta_"+manager,"{}"))
+                           for manager in ("series","movie")}}
+
+    def library_stale_preview(self):
+        # Strictly passive. Only completed, recent manager snapshots may
+        # identify stale entries. Never extrapolate a zero for missing input.
+        from datetime import timedelta
+        threshold=datetime.now(timezone.utc)-timedelta(minutes=60)
+        with self.lock,self.connect() as db:
+            opts=dict(db.execute("SELECT key,value FROM options"))
+            request=int(opts.get("sync_request_id","0"))
+            results={}
+            total_stale=0
+            for manager in ("series","movie"):
+                last=opts.get("synced_"+manager)
+                completed=int(opts.get("completed_"+manager,"0"))
+                fresh=False
+                if last:
+                    try:
+                        value=datetime.fromisoformat(last)
+                        fresh=bool(value.tzinfo and value>=threshold)
+                    except ValueError:
+                        pass
+                ready=fresh and (request==0 or completed>=request)
+                if not ready:
+                    results[manager]={"state":"awaitingSnapshot",
+                                      "requestId":request,
+                                      "lastSynced":last,"staleCount":None,
+                                      "items":[],"truncated":False}
+                    continue
+                count=db.execute("SELECT count(*) FROM artwork WHERE manager=?",(manager,)).fetchone()[0]
+                where="""SELECT manager,entity,library_id,season,title FROM artwork a
+                    WHERE manager=? AND NOT EXISTS (
+                      SELECT 1 FROM library_snapshot s
+                      WHERE s.manager=a.manager AND s.entity=a.entity
+                        AND s.library_id=a.library_id AND s.season=a.season)"""
+                stale_count=db.execute("SELECT count(*) FROM ("+where+")",(manager,)).fetchone()[0]
+                records=db.execute(where+" ORDER BY entity,library_id,season LIMIT 100",(manager,)).fetchall()
+                results[manager]={
+                    "state":"complete","requestId":completed,
+                    "lastSynced":last,"staleCount":stale_count,
+                    "registeredCount":count,
+                    "cleanupGuardPassed":stale_count<=max(20,int(count*.30)),
+                    "items":[{"manager":row["manager"],"entity":row["entity"],
+                              "libraryId":row["library_id"],"season":row["season"],
+                              "title":row["title"] or row["library_id"]} for row in records],
+                    "truncated":stale_count>len(records)
+                }
+                total_stale+=stale_count
+        return {"requestId":request,"byManager":results,"staleTotal":total_stale,
+                "complete":all(row["state"]=="complete" for row in results.values())}
 
     def request_library_sync(self):
         with self.lock,self.connect() as db:
@@ -307,6 +358,16 @@ class Store:
             if key in unique:raise ValueError("Duplicate library ID in snapshot.")
             unique.add(key)
         with self.lock,self.connect() as db:
+            previous={tuple(row) for row in db.execute(
+                "SELECT manager,entity,library_id,season FROM library_snapshot WHERE manager=?",
+                (manager,)).fetchall()}
+            delta={"added":len(unique-previous),
+                   "removed":len(previous-unique),
+                   "unchanged":len(unique & previous),
+                   "current":len(unique)}
+            db.execute("INSERT INTO options(key,value) VALUES(?,?) ON CONFLICT(key) "
+                       "DO UPDATE SET value=excluded.value",
+                       ("snapshot_delta_"+manager,json.dumps(delta,sort_keys=True)))
             db.execute("DELETE FROM library_snapshot WHERE manager=?",(manager,))
             db.executemany("INSERT INTO library_snapshot(manager,entity,library_id,season) VALUES(?,?,?,?)",sorted(unique))
             db.execute("INSERT INTO options(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",("synced_"+manager,now()))
@@ -711,6 +772,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path=="/v1/status": return self.send_json(200,self.store.stats())
             if path=="/v1/library/status": return self.send_json(200,self.store.library_status())
+            if path=="/v1/library/stale": return self.send_json(200,self.store.library_stale_preview())
             if path=="/v1/export":
                 from mvartwork.backup import create_backup
                 archive,size,counts=create_backup(self.store)

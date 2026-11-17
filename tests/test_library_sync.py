@@ -82,6 +82,47 @@ class LibrarySyncTests(unittest.TestCase):
         self.assertEqual(len(self.store.items("movie")),1)
         self.assertEqual(self.store.item(("series","season","10",2))["season"],2)
 
+    def test_stale_preview_requires_complete_independent_snapshots(self):
+        self.register("movie",101)
+        self.register("series",201)
+        info=self.store.library_stale_preview()
+        self.assertFalse(info["complete"])
+        self.assertIsNone(info["byManager"]["movie"]["staleCount"])
+        self.assertEqual(info["byManager"]["series"]["state"],"awaitingSnapshot")
+        self.store.request_library_sync()
+        self.snapshot("movie",[202])
+        info=self.store.library_stale_preview()
+        self.assertEqual(info["byManager"]["movie"]["staleCount"],1)
+        self.assertEqual(info["byManager"]["movie"]["items"][0]["libraryId"],"101")
+        self.assertEqual(info["byManager"]["series"]["state"],"awaitingSnapshot")
+        self.assertFalse(info["complete"])
+        self.snapshot("series",[201])
+        info=self.store.library_stale_preview()
+        self.assertTrue(info["complete"])
+        self.assertEqual(info["staleTotal"],1)
+        self.assertEqual(info["byManager"]["series"]["staleCount"],0)
+        self.assertEqual(info["byManager"]["movie"]["staleCount"],1)
+
+    def test_sync_delta_only_reports_database_membership(self):
+        self.register("series",1)
+        self.register("series",2)
+        self.snapshot("series",[1,2])
+        first=self.store.library_status()["changes"]["series"]
+        self.assertEqual((first["added"],first["removed"],first["unchanged"]),(2,0,0))
+        self.snapshot("series",[2,3])
+        next=self.store.library_status()["changes"]["series"]
+        self.assertEqual((next["added"],next["removed"],next["unchanged"]),(1,1,1))
+        self.assertIsNone(self.store.library_stale_preview()["byManager"]["movie"]["staleCount"])
+
+    def test_preview_does_not_remove_stale_and_reports_safety_guard(self):
+        for id in range(50):self.register("movie",id)
+        self.snapshot("movie",[0])
+        preview=self.store.library_stale_preview()["byManager"]["movie"]
+        self.assertEqual(preview["staleCount"],49)
+        self.assertFalse(preview["cleanupGuardPassed"])
+        self.assertEqual(len(preview["items"]),49)
+        self.assertEqual(len(self.store.items("movie")),50)
+
     def test_mass_deletion_guard(self):
         for id in range(100):self.register("movie",id)
         self.snapshot("movie",[0])

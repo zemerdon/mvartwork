@@ -1,3 +1,25 @@
+# MVArtwork v0.2.1 Stable — verified snapshot differences and stale preview
+
+This independent Stable update adds read-only, manager-scoped
+**GET /v1/library/stale** for a bounded (up to 100 titles per manager)
+preview of records absent from the most recent complete, recent
+Series or Movies snapshot. Missing or pending snapshots report
+**awaitingSnapshot**, never a fabricated zero. All queries are
+against the existing MVArtwork SQLite catalog; no media-file
+enumeration, IMDb rebuild, full library scan or deletion occurs
+when opening the preview.
+
+GET /v1/library/status now reports snapshot membership changes:
+added, removed, unchanged and current per manager. These are
+library-ID set differences, **not** guesses about download progress
+or changed poster/title metadata. The existing explicit cleanup
+retains its separate freshness, request-ack and mass-deletion
+protections. Existing SQLite files, poster locks and backups remain
+compatible. This component is versioned, published and upgraded
+independently from Core and Media Vision API.
+
+---
+
 ## 2026-11-17 — MVArtwork Stable-only workflow (current)
 
 <!-- MV_ARTWORK_STABLE_ONLY_WORKFLOW_20261117 -->
