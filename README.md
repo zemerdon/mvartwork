@@ -1,3 +1,22 @@
+## 2026-11-17 — MVArtwork Stable-only workflow (current)
+
+<!-- MV_ARTWORK_STABLE_ONLY_WORKFLOW_20261117 -->
+
+MVArtwork is an **independent optional component** pinned by its own
+Stable release. Its sole public update and installer channel is
+**Stable**; latest remains v0.2.0 until independently verified and
+authorized. The single canonical public GitHub source branch is
+main; the mv-dev local working branch is stable. Historical Develop
+prereleases and old instructions remain immutable historical records,
+not available update channels. Development, QA and feature tests
+occur in detached or disposable scratch worktrees, without active
+develop/feature/QA branches. The source, installer, checksums,
+independent API version pin and official Stable release are verified
+separately from the Core product. Never touch installed MVArtwork
+cache, user media, SQLite or operator pins without explicit authority.
+
+---
+
 # MVArtwork v0.2.0 Stable
 
 **Stable is the only supported public update and release channel.**
