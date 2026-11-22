@@ -18,7 +18,7 @@ from urllib.parse import urlsplit, parse_qs, unquote
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 from urllib.error import HTTPError, URLError
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 ORIGINS = {"artworks.thetvdb.com", "images.thetvdb.com",
            "thetvdb.com", "www.thetvdb.com", "image.tmdb.org"}
 MAX_IMAGE = 12 * 1024 * 1024
@@ -63,6 +63,12 @@ CREATE TABLE IF NOT EXISTS options (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 INSERT OR IGNORE INTO options(key,value) VALUES('paused','0');
 INSERT OR IGNORE INTO options(key,value) VALUES('auto_sync','1');
 INSERT OR IGNORE INTO options(key,value) VALUES('sync_request_id','0');
+INSERT OR IGNORE INTO options(key,value)
+ SELECT 'sync_request_series',value FROM options WHERE key='sync_request_id';
+INSERT OR IGNORE INTO options(key,value)
+ SELECT 'sync_request_movie',value FROM options WHERE key='sync_request_id';
+INSERT OR IGNORE INTO options(key,value) VALUES('sync_stop_id','0');
+INSERT OR IGNORE INTO options(key,value) VALUES('sync_stop_at','');
 CREATE TABLE IF NOT EXISTS library_snapshot (
  manager TEXT NOT NULL CHECK(manager IN ('series','movie')),
  entity TEXT NOT NULL, library_id TEXT NOT NULL, season INTEGER NOT NULL,
@@ -269,11 +275,24 @@ class Store:
 
     def library_status(self):
         with self.lock,self.connect() as db:
-            opts=dict(db.execute("SELECT key,value FROM options WHERE key IN ('auto_sync','sync_request_id','synced_series','synced_movie','completed_series','completed_movie','snapshot_delta_series','snapshot_delta_movie')"))
+            opts=dict(db.execute("SELECT key,value FROM options WHERE key IN "
+                "('auto_sync','sync_request_id','sync_request_series','sync_request_movie',"
+                "'sync_stop_id','sync_stop_at','sync_progress_series','sync_progress_movie',"
+                "'synced_series','synced_movie','completed_series','completed_movie',"
+                "'snapshot_delta_series','snapshot_delta_movie')"))
             counts={manager:db.execute("SELECT count(*) FROM library_snapshot WHERE manager=?",
-                                     (manager,)).fetchone()[0] for manager in ("series","movie")}
+                                      (manager,)).fetchone()[0] for manager in ("series","movie")}
+        def progress_for(manager):
+            try:return json.loads(opts.get("sync_progress_"+manager,"{}"))
+            except (ValueError,TypeError):return {}
+        latest=int(opts.get("sync_request_id","0"))
         return {"autoSync":opts.get("auto_sync","1")=="1",
-                "requestId":int(opts.get("sync_request_id","0")),
+                "requestId":latest,
+                "requested":{manager:int(opts.get("sync_request_"+manager,str(latest)))
+                             for manager in ("series","movie")},
+                "stopId":int(opts.get("sync_stop_id","0")),
+                "stopAt":opts.get("sync_stop_at") or None,
+                "progress":{manager:progress_for(manager) for manager in ("series","movie")},
                 "completed":{"series":int(opts.get("completed_series","0")),
                              "movie":int(opts.get("completed_movie","0"))},
                 "snapshots":counts,
@@ -302,10 +321,11 @@ class Store:
                         fresh=bool(value.tzinfo and value>=threshold)
                     except ValueError:
                         pass
-                ready=fresh and (request==0 or completed>=request)
+                wanted=int(opts.get("sync_request_"+manager,str(request)))
+                ready=fresh and (wanted==0 or completed>=wanted)
                 if not ready:
                     results[manager]={"state":"awaitingSnapshot",
-                                      "requestId":request,
+                                      "requestId":wanted,
                                       "lastSynced":last,"staleCount":None,
                                       "items":[],"truncated":False}
                     continue
@@ -331,12 +351,106 @@ class Store:
         return {"requestId":request,"byManager":results,"staleTotal":total_stale,
                 "complete":all(row["state"]=="complete" for row in results.values())}
 
-    def request_library_sync(self):
+    def request_library_sync(self, data=None):
+        data={} if data is None else data
+        manager=data.get("manager","all")
+        if manager not in ("all","series","movie"):
+            raise ValueError("Sync manager must be all, series or movie.")
         with self.lock,self.connect() as db:
             row=db.execute("SELECT value FROM options WHERE key='sync_request_id'").fetchone()
             next_id=int(row[0] if row else "0")+1
-            db.execute("INSERT INTO options(key,value) VALUES('sync_request_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(next_id),))
+            db.execute("INSERT INTO options(key,value) VALUES('sync_request_id',?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(next_id),))
+            for selected in ("series","movie"):
+                if manager in ("all",selected):
+                    db.execute("INSERT INTO options(key,value) VALUES(?,?) "
+                               "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                               ("sync_request_"+selected,str(next_id)))
+                    queued={"state":"queued","requestId":next_id,
+                            "processed":0,"total":0,"stage":"Waiting for Media Vision"}
+                    db.execute("INSERT INTO options(key,value) VALUES(?,?) "
+                               "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                               ("sync_progress_"+selected,json.dumps(queued)))
         return self.library_status()
+
+    def stop_library_sync(self):
+        with self.lock,self.connect() as db:
+            row=db.execute("SELECT value FROM options WHERE key='sync_stop_id'").fetchone()
+            stop_id=int(row[0] if row else "0")+1
+            db.execute("INSERT INTO options(key,value) VALUES('sync_stop_id',?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(stop_id),))
+            db.execute("INSERT INTO options(key,value) VALUES('sync_stop_at',?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",(now(),))
+            for manager in ("series","movie"):
+                current=db.execute("SELECT value FROM options WHERE key=?",
+                                   ("sync_progress_"+manager,)).fetchone()
+                if not current:continue
+                try: progress=json.loads(current[0])
+                except (ValueError,TypeError):continue
+                if progress.get("state") in ("running","queued"):
+                    progress["state"]="stopping" if progress["state"]=="running" else "cancelled"
+                    progress["stage"]="Cancellation requested" if progress["state"]=="stopping" else "Cancelled before starting"
+                    db.execute("UPDATE options SET value=? WHERE key=?",
+                               (json.dumps(progress),"sync_progress_"+manager))
+        return self.library_status()
+
+    def publish_library_progress(self, data):
+        if not isinstance(data,dict) or data.get("manager") not in ("series","movie"):
+            raise ValueError("Invalid library sync progress manager.")
+        manager=data["manager"]
+        request=data.get("requestId")
+        processed=data.get("processed")
+        total=data.get("total")
+        run_id=data.get("runId")
+        state=data.get("state")
+        stage=data.get("stage")
+        started=data.get("startedAt")
+        failures=data.get("failures",0)
+        if (type(request) is not int or request<0 or
+            type(processed) is not int or type(total) is not int or
+            not (0<=processed<=total<=50000) or
+            type(failures) is not int or not (0<=failures<=50000) or
+            not isinstance(run_id,str) or not re.fullmatch(r"[a-f0-9]{32}",run_id) or
+            state not in ("running","complete","failed","cancelled") or
+            not isinstance(stage,str) or len(stage)>100 or
+            any(ord(c)<32 for c in stage) or
+            not isinstance(started,str) or len(started)>50):
+            raise ValueError("Invalid library synchronization progress.")
+        try:
+            timestamp=datetime.fromisoformat(started.replace("Z","+00:00"))
+            if timestamp.tzinfo is None:raise ValueError()
+        except ValueError:
+            raise ValueError("Invalid progress start time.")
+        with self.lock,self.connect() as db:
+            target=db.execute("SELECT value FROM options WHERE key=?",
+                              ("sync_request_"+manager,)).fetchone()
+            if target and int(target[0])!=request:
+                raise ValueError("Stale library sync request ID.")
+            current=db.execute("SELECT value FROM options WHERE key=?",
+                               ("sync_progress_"+manager,)).fetchone()
+            previous={}
+            if current:
+                try:previous=json.loads(current[0])
+                except (ValueError,TypeError):pass
+            # Do not allow late writes from an earlier run to replace this
+            # request's newer progress. Also preserve completed cancellation.
+            if (previous.get("requestId")==request and
+                previous.get("runId")==run_id and
+                previous.get("state") in ("complete","failed","cancelled") and
+                state=="running"):
+                raise ValueError("Cannot reopen completed synchronization.")
+            if previous.get("requestId")==request and previous.get("state")=="stopping":
+                if state in ("running","complete"):
+                    state="stopping"
+                    stage="Cancellation requested"
+            payload={"requestId":request,"runId":run_id,"manager":manager,
+                     "processed":processed,"total":total,"state":state,
+                     "stage":stage,"failures":failures,"startedAt":started,
+                     "updatedAt":now()}
+            db.execute("INSERT INTO options(key,value) VALUES(?,?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                       ("sync_progress_"+manager,json.dumps(payload,sort_keys=True)))
+        return payload
 
     def set_auto_sync(self, enabled):
         if type(enabled) is not bool: raise ValueError("Auto Sync must be Boolean.")
@@ -348,6 +462,9 @@ class Store:
         if not isinstance(data,dict) or data.get("manager") not in ("series","movie") or data.get("complete") is not True:
             raise ValueError("A verified complete manager library snapshot is required.")
         manager=data["manager"];records=data.get("records")
+        request=data.get("requestId")
+        if request is not None and (type(request) is not int or request<0):
+            raise ValueError("Invalid snapshot request ID.")
         if not isinstance(records,list) or not (1<=len(records)<=50000):
             raise ValueError("A complete, nonempty library snapshot is required.")
         unique=set()
@@ -358,6 +475,20 @@ class Store:
             if key in unique:raise ValueError("Duplicate library ID in snapshot.")
             unique.add(key)
         with self.lock,self.connect() as db:
+            current=db.execute("SELECT value FROM options WHERE key=?",
+                               ("sync_request_"+manager,)).fetchone()
+            latest=db.execute("SELECT value FROM options WHERE key='sync_request_id'").fetchone()
+            expected=int(current[0] if current else (latest[0] if latest else "0"))
+            if request is not None and request != expected:
+                raise ValueError("Snapshot belongs to a superseded sync request.")
+            status=db.execute("SELECT value FROM options WHERE key=?",
+                              ("sync_progress_"+manager,)).fetchone()
+            if status and request is not None:
+                try: current_progress=json.loads(status[0])
+                except (ValueError,TypeError): current_progress={}
+                if (current_progress.get("requestId")==request and
+                    current_progress.get("state") in ("stopping","cancelled")):
+                    raise ValueError("Cancelled sync cannot publish a completed snapshot.")
             previous={tuple(row) for row in db.execute(
                 "SELECT manager,entity,library_id,season FROM library_snapshot WHERE manager=?",
                 (manager,)).fetchall()}
@@ -371,8 +502,8 @@ class Store:
             db.execute("DELETE FROM library_snapshot WHERE manager=?",(manager,))
             db.executemany("INSERT INTO library_snapshot(manager,entity,library_id,season) VALUES(?,?,?,?)",sorted(unique))
             db.execute("INSERT INTO options(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",("synced_"+manager,now()))
-            row=db.execute("SELECT value FROM options WHERE key='sync_request_id'").fetchone()
-            db.execute("INSERT INTO options(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",("completed_"+manager,row[0] if row else "0"))
+            db.execute("INSERT INTO options(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                       ("completed_"+manager,str(expected)))
         return {"manager":manager,"count":len(unique),"complete":True}
 
     def remove_stale_artwork(self):
@@ -390,7 +521,10 @@ class Store:
                     except ValueError: pass
             if not managers:raise ValueError("Sync Library before removing stale artwork.")
             latest=int(opts.get("sync_request_id","0"))
-            if latest>0 and any(int(opts.get("completed_"+manager,"0"))<latest for manager in managers):
+            if latest>0 and any(
+                int(opts.get("completed_"+manager,"0")) <
+                int(opts.get("sync_request_"+manager,str(latest)))
+                for manager in managers):
                 raise ValueError("Complete the requested Sync Library operation before removing stale artwork.")
             stale=[];total=0
             for manager in managers:
@@ -864,7 +998,9 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError,UnicodeDecodeError): return self.send_json(400,{"error":"Invalid JSON."})
         if not isinstance(body,dict): return self.send_json(400,{"error":"Expected object."})
         try:
-            if self.path=="/v1/library/request": return self.send_json(200,self.store.request_library_sync())
+            if self.path=="/v1/library/request": return self.send_json(200,self.store.request_library_sync(body))
+            if self.path=="/v1/library/stop": return self.send_json(200,self.store.stop_library_sync())
+            if self.path=="/v1/library/progress": return self.send_json(200,self.store.publish_library_progress(body))
             if self.path=="/v1/library/options": return self.send_json(200,self.store.set_auto_sync(body.get("enabled")))
             if self.path=="/v1/library/snapshot": return self.send_json(200,self.store.receive_library_snapshot(body))
             if self.path=="/v1/library/remove-stale": return self.send_json(200,self.store.remove_stale_artwork())

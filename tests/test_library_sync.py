@@ -37,6 +37,79 @@ class LibrarySyncTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.set_auto_sync("false")
 
+    def test_scoped_sync_progress_and_stale_request_are_independent(self):
+        import datetime
+        start=datetime.datetime.now(datetime.timezone.utc).isoformat()
+        initial=self.store.library_status()
+        request=self.store.request_library_sync({"manager":"series"})
+        self.assertEqual(request["requested"]["series"],1)
+        self.assertEqual(request["requested"]["movie"],0)
+        progress=self.store.publish_library_progress({
+            "manager":"series","requestId":1,"runId":"a"*32,
+            "state":"running","processed":1,"total":2,"failures":0,
+            "stage":"Registering seasons","startedAt":start})
+        self.assertEqual(progress["processed"],1)
+        self.assertEqual(self.store.library_status()["progress"]["series"]["total"],2)
+        self.assertEqual(self.store.library_status()["progress"]["movie"],{})
+        self.register("series",17)
+        self.assertEqual(self.snapshot("series",[17])["count"],1)
+        self.assertEqual(self.store.library_status()["completed"]["series"],1)
+        request=self.store.request_library_sync({"manager":"movie"})
+        self.assertEqual(request["requested"]["series"],1)
+        self.assertEqual(request["requested"]["movie"],2)
+        with self.assertRaisesRegex(ValueError,"superseded"):
+            self.store.receive_library_snapshot({
+                "manager":"movie","requestId":1,"complete":True,
+                "records":[{"entity":"movie","library_id":"4","season":-1}]})
+        self.assertEqual(self.store.library_status()["completed"]["series"],1)
+
+    def test_stop_sync_and_invalid_progress_preserve_library(self):
+        import datetime
+        start=datetime.datetime.now(datetime.timezone.utc).isoformat()
+        self.register("movie",4)
+        self.store.request_library_sync({"manager":"movie"})
+        self.store.publish_library_progress({
+            "manager":"movie","requestId":1,"runId":"b"*32,
+            "state":"running","processed":1,"total":5,"failures":0,
+            "stage":"Registering movies","startedAt":start})
+        stopped=self.store.stop_library_sync()
+        self.assertEqual(stopped["stopId"],1)
+        self.assertIsNotNone(stopped["stopAt"])
+        self.assertIn("+00:00",stopped["stopAt"])
+        self.assertEqual(stopped["progress"]["movie"]["state"],"stopping")
+        self.assertEqual(len(self.store.items("movie")),1)
+        with self.assertRaisesRegex(ValueError,"Invalid library synchronization progress"):
+            self.store.publish_library_progress({
+                "manager":"movie","requestId":1,"runId":"b"*32,
+                "state":"running","processed":9,"total":5,"failures":0,
+                "stage":"Registering movies","startedAt":start})
+
+    def test_stopping_sync_rejects_late_snapshot_and_other_manager_still_completes(self):
+        import datetime
+        start=datetime.datetime.now(datetime.timezone.utc).isoformat()
+        self.store.request_library_sync()
+        self.register("series",12)
+        self.register("movie",7)
+        self.store.publish_library_progress({
+            "manager":"series","requestId":1,"runId":"c"*32,
+            "state":"running","processed":1,"total":1,"failures":0,
+            "stage":"Publishing Series snapshot","startedAt":start})
+        self.store.stop_library_sync()
+        with self.assertRaisesRegex(ValueError,"Cancelled sync"):
+            self.store.receive_library_snapshot({
+                "manager":"series","requestId":1,"complete":True,
+                "records":[{"entity":"series","library_id":"12","season":-1}]})
+        info=self.store.library_status()
+        self.assertEqual(info["completed"]["series"],0)
+        self.assertEqual(info["snapshots"]["series"],0)
+        # A separately scoped subsequent request still works.
+        scoped=self.store.request_library_sync({"manager":"movie"})
+        self.assertEqual(scoped["requested"]["movie"],2)
+        self.assertEqual(self.store.receive_library_snapshot({
+            "manager":"movie","requestId":2,"complete":True,
+            "records":[{"entity":"movie","library_id":"7","season":-1}]}),{"manager":"movie","count":1,"complete":True})
+        self.assertEqual(self.store.library_status()["completed"]["movie"],2)
+
     def test_snapshot_never_guesses_or_cleans_an_incomplete_collection(self):
         self.register("movie",4)
         for value in ({},{"manager":"movie","complete":True,"records":[]},

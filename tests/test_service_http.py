@@ -144,6 +144,42 @@ class HttpFixture(unittest.TestCase):
         self.assertEqual(json.loads(body)["items"][0]["title"],"The Show")
         self.assertEqual(self.req("POST","/v1/titles",{"manager":"movie","titles":[]})[0],400)
 
+    def test_live_progress_http_scoping_authentication_and_stop(self):
+        import datetime
+        started=datetime.datetime.now(datetime.timezone.utc).isoformat()
+        self.assertEqual(self.req("POST","/v1/library/request",{
+            "manager":"series"},token="wrong")[0],401)
+        status,_,body=self.req("POST","/v1/library/request",{
+            "manager":"series"})
+        self.assertEqual(status,200)
+        result=json.loads(body)
+        self.assertEqual(result["requestId"],1)
+        self.assertEqual(result["requested"]["series"],1)
+        self.assertEqual(result["requested"]["movie"],0)
+        progress={"manager":"series","requestId":1,"runId":"e"*32,
+                  "state":"running","processed":1,"total":4,
+                  "failures":0,"stage":"Registering seasons","startedAt":started}
+        self.assertEqual(self.req("POST","/v1/library/progress",progress,
+                                  token="wrong")[0],401)
+        self.assertEqual(self.req("POST","/v1/library/progress",progress)[0],200)
+        status,_,body=self.req("GET","/v1/library/status")
+        self.assertEqual(status,200)
+        self.assertEqual(json.loads(body)["progress"]["series"]["processed"],1)
+        self.assertEqual(json.loads(body)["progress"]["movie"],{})
+        self.assertEqual(self.req("POST","/v1/library/stop",{},
+                                  token="wrong")[0],401)
+        status,_,body=self.req("POST","/v1/library/stop",{})
+        self.assertEqual(status,200)
+        stopped=json.loads(body)
+        self.assertEqual(stopped["progress"]["series"]["state"],"stopping")
+        self.assertIsNotNone(stopped["stopAt"])
+        # Authentication, scope and cancellation do not mutate any
+        # pre-existing complete snapshot.
+        self.assertEqual(stopped["snapshots"]["series"],0)
+        self.assertEqual(stopped["snapshots"]["movie"],0)
+        self.assertEqual(self.req("POST","/v1/library/request",{
+            "manager":"invalid"})[0],400)
+
     def test_upload_and_invalid_cross_manager(self):
         status,_,body=self.req("POST","/v1/upload",{
             "manager":"movie","entity":"movie","library_id":"19",

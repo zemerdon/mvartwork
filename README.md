@@ -1,4 +1,4 @@
-# MVArtwork v0.2.1 Stable — verified snapshot differences and stale preview
+# MVArtwork v0.2.2 Stable — manager-scoped library sync progress and cancellation
 
 This independent Stable update adds read-only, manager-scoped
 **GET /v1/library/stale** for a bounded (up to 100 titles per manager)
