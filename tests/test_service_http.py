@@ -1,6 +1,8 @@
 import base64
 import http.client
 import json
+import sqlite3
+from unittest.mock import patch
 import tempfile
 import threading
 import unittest
@@ -32,6 +34,18 @@ class HttpFixture(unittest.TestCase):
         out=(res.status,dict(res.getheaders()),body)
         conn.close()
         return out
+    def test_busy_database_has_safe_classified_response(self):
+        exc=sqlite3.OperationalError("private sqlite path")
+        exc.sqlite_errorcode=sqlite3.SQLITE_BUSY
+        for manager,entity in (("series","series"),("movie","movie")):
+            with patch.object(self.store,"register",side_effect=exc):
+                status,_,body=self.req("POST","/v1/items",{
+                    "manager":manager,"entity":entity,"library_id":"1"})
+                self.assertEqual(status,503)
+                self.assertEqual(json.loads(body)["code"],"artwork_database_busy")
+                self.assertNotIn(b"private",body)
+        self.assertEqual(self.req("GET","/health",token="")[0],200)
+
     def test_http_registration_auth_separation_and_image(self):
         status,_,_=self.req("GET","/v1/status",token="wrong")
         self.assertEqual(status,401)

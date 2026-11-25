@@ -18,7 +18,7 @@ from urllib.parse import urlsplit, parse_qs, unquote
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 from urllib.error import HTTPError, URLError
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 ORIGINS = {"artworks.thetvdb.com", "images.thetvdb.com",
            "thetvdb.com", "www.thetvdb.com", "image.tmdb.org"}
 MAX_IMAGE = 12 * 1024 * 1024
@@ -1025,6 +1025,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(404,{"error":"Unknown route"})
         except (ValueError,KeyError) as exc:
             return self.send_json(404 if isinstance(exc,KeyError) else 400,{"error":str(exc)})
+        except sqlite3.OperationalError as exc:
+            # Fixed reason only; do not expose SQL or file paths.
+            code=getattr(exc,"sqlite_errorcode",0) or 0
+            if (code & 255) in (sqlite3.SQLITE_BUSY,sqlite3.SQLITE_LOCKED):
+                return self.send_json(503,{"error":"Artwork database busy","code":"artwork_database_busy"})
+            return self.send_json(500,{"error":"Artwork database operation failed","code":"artwork_database_error"})
 
 def serve(folder,secret,port=9494):
     if not secret or len(secret)<24:
